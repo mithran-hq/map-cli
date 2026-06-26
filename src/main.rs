@@ -447,8 +447,12 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
         } else {
             println!("{phase}");
         }
-        if matches!(phase, "Succeeded" | "Failed" | "Superseded") {
-            return Ok(());
+        if is_terminal_phase(phase) {
+            return if phase == "Succeeded" {
+                Ok(())
+            } else {
+                Err(format!("deploy reached terminal state {phase}"))
+            };
         }
         if elapsed >= args.timeout_seconds {
             return Err("watch timed out".to_string());
@@ -456,6 +460,24 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
         thread::sleep(Duration::from_secs(args.interval_seconds));
         elapsed += args.interval_seconds;
     }
+}
+
+/// Terminal deployment phases reported by the control-plane deploy state
+/// machine (see `mithran-control-plane` `DeploymentStatus`). Every phase here
+/// stops the watch loop; only `Succeeded` is a success, so callers treat any
+/// other terminal phase as a failure.
+fn is_terminal_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        "Succeeded"
+            | "Failed"
+            | "Superseded"
+            | "RolledBack"
+            | "ReviewBlocked"
+            | "BuildFailed"
+            | "RuntimeFailed"
+            | "RouteFailed"
+    )
 }
 
 fn print_response(json_output: bool, response: reqwest::blocking::Response) -> Result<(), String> {
@@ -468,6 +490,15 @@ fn print_response(json_output: bool, response: reqwest::blocking::Response) -> R
     }
     if json_output {
         println!("{text}");
+    } else if let Some(deployment_ref) = serde_json::from_str::<Value>(&text)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.get("deployment_ref"))
+        .and_then(|value| value.as_str())
+    {
+        // Surface the server-generated ref so the user can run `map status`,
+        // `map watch`, or `map evidence` against it.
+        println!("{deployment_ref}");
     } else {
         println!("ok");
     }
@@ -496,6 +527,25 @@ fn redact(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_every_control_plane_terminal_phase() {
+        for phase in [
+            "Succeeded",
+            "Failed",
+            "Superseded",
+            "RolledBack",
+            "ReviewBlocked",
+            "BuildFailed",
+            "RuntimeFailed",
+            "RouteFailed",
+        ] {
+            assert!(is_terminal_phase(phase), "{phase} must be terminal");
+        }
+        for phase in ["IntentReceived", "BuildPending", "RuntimeReady", "unknown"] {
+            assert!(!is_terminal_phase(phase), "{phase} must not be terminal");
+        }
+    }
 
     #[test]
     fn validates_git_sha() {
