@@ -1,7 +1,8 @@
 # MAP CLI
 
 `map` is the thin command-line client for MAP 1.0. It is distributed by
-`Aegis.pkg` and talks to the hosted `mithran-map-control` service.
+`Aegis.pkg` and talks to the hosted `mithran-control-plane` service over its
+`/v1/map-control/deploy/*` routes.
 
 The client does not build, schedule, or run applications locally. Deployments
 are always based on committed GitHub refs or SHAs.
@@ -35,7 +36,7 @@ Public:
 
 Private:
 
-- `mithran-map-control`;
+- `mithran-control-plane`;
 - build orchestration;
 - sidecar admission;
 - runtime-control and worker provisioning.
