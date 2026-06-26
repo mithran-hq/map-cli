@@ -272,24 +272,38 @@ fn run(cli: Cli) -> Result<(), String> {
             validate_target(&args.target)?;
             post(
                 &cli,
-                "/v1/deployments",
+                "/v1/map-control/deploy/request",
                 json!({
-                    "repo": args.target.repo,
-                    "env": args.target.env,
-                    "ref": args.target.ref_name,
-                    "sha": args.target.sha,
-                    "evidence_ref": args.evidence_ref,
+                    "repository_ref": args.target.repo,
+                    "app_env": args.target.env,
+                    "requested_ref": args.target.ref_name,
+                    "source_sha": args.target.sha,
+                    "authority_evidence_ref": args.evidence_ref,
                 }),
             )
         }
-        Command::Status(args) => get(&cli, &format!("/v1/deployments/{}", args.id)),
+        Command::Status(args) => get(
+            &cli,
+            "/v1/map-control/deploy/status",
+            &[("deployment_ref", args.id.as_str())],
+        ),
         Command::Watch(args) => watch(&cli, args),
-        Command::Logs(args) => get(&cli, &format!("/v1/deployments/{}/logs", args.id)),
-        Command::Evidence(args) => get(&cli, &format!("/v1/deployments/{}/evidence", args.id)),
+        Command::Logs(_) => Err(
+            "the live control plane exposes no deploy logs route; use `map status` or `map evidence`"
+                .to_string(),
+        ),
+        Command::Evidence(args) => get(
+            &cli,
+            "/v1/map-control/deploy/evidence",
+            &[("deployment_ref", args.id.as_str())],
+        ),
         Command::Rollback(args) => post(
             &cli,
-            &format!("/v1/deployments/{}/rollback", args.id),
-            json!({ "evidence_ref": args.evidence_ref }),
+            "/v1/map-control/deploy/rollback",
+            json!({
+                "deployment_ref": args.id,
+                "authority_evidence_ref": args.evidence_ref,
+            }),
         ),
         Command::Version => print_json_or_text(
             cli.json,
@@ -376,7 +390,7 @@ fn client(cli: &Cli) -> Result<(Client, LoginState), String> {
     Ok((client, state))
 }
 
-fn get(cli: &Cli, path: &str) -> Result<(), String> {
+fn get(cli: &Cli, path: &str, query: &[(&str, &str)]) -> Result<(), String> {
     let (client, state) = client(cli)?;
     let response = client
         .get(format!(
@@ -384,6 +398,7 @@ fn get(cli: &Cli, path: &str) -> Result<(), String> {
             state.map_control_endpoint.trim_end_matches('/'),
             path
         ))
+        .query(query)
         .bearer_auth(&state.access_token)
         .send()
         .map_err(|error| format!("MAP request failed: {error}"))?;
@@ -411,25 +426,28 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
         let (client, state) = client(cli)?;
         let response = client
             .get(format!(
-                "{}/v1/deployments/{}",
+                "{}/v1/map-control/deploy/status",
                 state.map_control_endpoint.trim_end_matches('/'),
-                args.id
             ))
+            .query(&[("deployment_ref", args.id.as_str())])
             .bearer_auth(&state.access_token)
             .send()
             .map_err(|error| format!("MAP watch failed: {error}"))?;
         let value: Value = response
             .json()
             .map_err(|error| format!("read MAP watch response: {error}"))?;
+        let phase = value
+            .get("deployment")
+            .and_then(|deployment| deployment.get("status"))
+            .and_then(|status| status.get("status"))
+            .and_then(|phase| phase.as_str())
+            .unwrap_or("unknown");
         if cli.json {
             println!("{}", serde_json::to_string(&value).unwrap());
         } else {
-            println!("{}", value["status"].as_str().unwrap_or("unknown"));
+            println!("{phase}");
         }
-        if matches!(
-            value["status"].as_str(),
-            Some("succeeded" | "failed" | "cancelled")
-        ) {
+        if matches!(phase, "Succeeded" | "Failed" | "Superseded") {
             return Ok(());
         }
         if elapsed >= args.timeout_seconds {
