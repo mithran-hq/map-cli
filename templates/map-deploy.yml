@@ -1,0 +1,117 @@
+# map-deploy.yml — thin MAP deploy trigger (ADR-0016, map-cli#4).
+#
+# `map deploy --env <env> --ref <ref>` dispatches THIS workflow (workflow_dispatch).
+# GitHub is the trigger + audit/status surface ONLY. No LLM / build / heavy work
+# runs here — the deploy-review gate stays server-side in mithran-control-plane.
+# All this workflow does is POST the deploy request to the control-plane chokepoint
+# `/v1/map-control/deploy/request`; the state machine reviews-before-build as usual.
+#
+# `map setup <owner/repo> --repo-dir <checkout>` drops this file into a repo at
+# `.github/workflows/map-deploy.yml`. Keep it in sync with map-cli/templates/map-deploy.yml.
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ ⚠ INGRESS GAP (must read).                                                   │
+# │ The control-plane listens on 127.0.0.1:4260 on the host — it is NOT          │
+# │ reachable from GitHub-hosted runners. This workflow therefore runs on a      │
+# │ SELF-HOSTED runner on the control-plane host (so localhost resolves), OR you │
+# │ must expose the control-plane through a public/webhook ingress and point     │
+# │ `MAP_CONTROL_ENDPOINT` at it. Until that ingress exists, keep `runs-on`      │
+# │ self-hosted. (Tracked under mithran-control-plane#49 / ADR-0016.)            │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+name: map-deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Target app env (preview | staging | production)"
+        required: true
+        default: preview
+        type: string
+      ref:
+        description: "Git ref or 40-hex SHA to deploy (defaults to the workflow ref)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  request-deploy:
+    # See INGRESS GAP above: must reach 127.0.0.1:4260 on the control-plane host.
+    runs-on: [self-hosted, mithran-control-plane]
+    timeout-minutes: 15
+    env:
+      # Repo/org Variables (Settings → Variables) — non-secret routing config.
+      MAP_CONTROL_ENDPOINT: ${{ vars.MAP_CONTROL_ENDPOINT || 'http://127.0.0.1:4260' }}
+      MAP_PLATFORM_ENV: ${{ vars.MAP_PLATFORM_ENV || 'sandbox' }}
+      MAP_INSTALLATION_REF: ${{ vars.MAP_INSTALLATION_REF }}
+      MAP_APP_REF: ${{ vars.MAP_APP_REF }}
+      MAP_TENANT_REF: ${{ vars.MAP_TENANT_REF }}
+      MAP_ACCOUNT_REF: ${{ vars.MAP_ACCOUNT_REF }}
+      # The ONLY secret this workflow may carry: a control-plane caller bearer token
+      # (optional — empty when the control-plane trusts the host-local self-hosted runner).
+      MAP_CONTROL_TOKEN: ${{ secrets.MAP_CONTROL_TOKEN }}
+      INPUT_ENV: ${{ inputs.env }}
+      INPUT_REF: ${{ inputs.ref }}
+    steps:
+      - name: POST deploy request to control-plane
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repo="${GITHUB_REPOSITORY}"                  # owner/repo
+          requested_ref="${INPUT_REF:-$GITHUB_REF}"    # git ref or SHA to deploy
+          app_env="${INPUT_ENV}"
+          platform_env="${MAP_PLATFORM_ENV}"
+          deployment_ref="deployment://${platform_env}/${app_env}/${repo##*/}-${GITHUB_RUN_ID}"
+
+          if [ -z "${MAP_INSTALLATION_REF}" ]; then
+            echo "::error::MAP_INSTALLATION_REF variable is required (deploy/request rejects a missing installation_ref). Set it via 'map setup' or repo Variables." >&2
+            exit 1
+          fi
+
+          # The source broker rejects requested_ref containing secret/token/etc.;
+          # for such branches pass the 40-hex SHA as the ref (see clean-room runbook §3).
+          source_sha=""
+          if printf '%s' "${requested_ref}" | grep -Eq '^[0-9a-f]{40}$'; then
+            source_sha="${requested_ref}"
+          fi
+
+          body="$(jq -nc \
+            --arg deployment_ref "${deployment_ref}" \
+            --arg repository_ref "github://${repo}" \
+            --arg requested_ref "${requested_ref}" \
+            --arg source_sha "${source_sha}" \
+            --arg installation_ref "${MAP_INSTALLATION_REF}" \
+            --arg app_ref "${MAP_APP_REF}" \
+            --arg app_env "${app_env}" \
+            --arg tenant_ref "${MAP_TENANT_REF}" \
+            --arg account_ref "${MAP_ACCOUNT_REF}" \
+            --arg platform_env "${platform_env}" \
+            '{deployment_ref:$deployment_ref, repository_ref:$repository_ref,
+              requested_ref:$requested_ref, installation_ref:$installation_ref,
+              app_ref:$app_ref, app_env:$app_env, tenant_ref:$tenant_ref,
+              account_ref:$account_ref, platform_env:$platform_env}
+             | if $source_sha != "" then . + {source_sha:$source_sha} else . end')"
+
+          echo "Dispatching deploy: ${deployment_ref} (env=${app_env} ref=${requested_ref})"
+
+          auth=()
+          if [ -n "${MAP_CONTROL_TOKEN}" ]; then
+            auth=(-H "authorization: Bearer ${MAP_CONTROL_TOKEN}")
+          fi
+
+          http_code="$(curl -sS --max-time 600 -o response.json -w '%{http_code}' \
+            -X POST "${MAP_CONTROL_ENDPOINT%/}/v1/map-control/deploy/request" \
+            -H 'content-type: application/json' "${auth[@]}" \
+            -d "${body}")"
+
+          echo "control-plane HTTP ${http_code}"
+          cat response.json || true
+          case "${http_code}" in
+            200|201|202) ;;
+            *) echo "::error::deploy request failed (HTTP ${http_code})" >&2; exit 1 ;;
+          esac
