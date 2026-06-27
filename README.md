@@ -16,8 +16,14 @@ map login save \
   --scope map:* \
   --scope audience:jason-controller
 
-map doctor
-map deploy --repo mithran-hq/demo --sha 0123456789abcdef0123456789abcdef01234567 --env staging
+# Onboard an app: drop the deploy workflow + print the host onboarding steps.
+map setup mithran-hq/demo --repo-dir ./demo
+
+# Diagnose readiness against the saved control-plane endpoint.
+map doctor --app mithran-hq/demo
+
+# Trigger a deploy (ADR-0016): dispatch the thin GitHub Actions workflow.
+map deploy --env staging --ref refs/heads/main --repo mithran-hq/demo
 ```
 
 Jason can reuse the MAP login by asking for a controller token:
@@ -25,6 +31,22 @@ Jason can reuse the MAP login by asking for a controller token:
 ```sh
 map login print-token --audience jason-controller
 ```
+
+## Deploy model (ADR-0016)
+
+`map deploy [--env --ref --repo]` does **not** call the control-plane directly. The
+control-plane listens on `127.0.0.1:4260` on the host and is not reachable from
+GitHub-hosted runners. `map deploy` instead **dispatches** a thin
+`.github/workflows/map-deploy.yml` workflow (`workflow_dispatch`, via the GitHub API using
+your `gh`/GitHub token); that workflow — running on a self-hosted runner on the host (or a
+public ingress) — POSTs the deploy request to `/v1/map-control/deploy/request`. GitHub is
+the trigger + audit surface; the deploy-review gate stays server-side.
+
+- `map setup <owner/repo>` adds that workflow to a repo and prints the host onboarding steps
+  (allowlist + bare-mirror create + `map-mirror-sync`). The host steps are printed because
+  there is no control-plane `onboard` endpoint yet (see map-cli#5).
+- `map deploy-request` is the host/runner-side primitive that POSTs straight to the
+  control-plane — only usable where `:4260` is reachable (host-local or via a tunnel).
 
 ## Boundary
 
