@@ -24,6 +24,12 @@ map doctor --app mithran-hq/demo
 
 # Trigger a deploy (ADR-0016): dispatch the thin GitHub Actions workflow.
 map deploy --env staging --ref refs/heads/main --repo mithran-hq/demo
+
+# List an app's addressable internal versions + which one is published (ADR-0018).
+map versions demo
+
+# Publish a reviewed, succeeded internal version to the app's clean public URL.
+map publish demo --version demo-2
 ```
 
 Jason can reuse the MAP login by asking for a controller token:
@@ -47,6 +53,26 @@ the trigger + audit surface; the deploy-review gate stays server-side.
   there is no control-plane `onboard` endpoint yet (see map-cli#5).
 - `map deploy-request` is the host/runner-side primitive that POSTs straight to the
   control-plane — only usable where `:4260` is reachable (host-local or via a tunnel).
+
+## Publish model (ADR-0018)
+
+A deploy makes an internal version *addressable* (its own per-version URL); it does **not**
+move the app's clean, env-bare public URL. That public URL is a separate **published**
+pointer the operator advances explicitly, so developers can iterate on internal versions
+without changing what end-users see.
+
+- `map versions <app>` reads `/v1/map-control/routes/status` and lists the app's addressable
+  internal versions (label → `deployment_ref` → per-version hostname), its aliases
+  (production/preview/release), and which internal version is currently published (or
+  `(not published)`). `<app>` is the app name, normalized to `app:<app>`.
+- `map publish <app> [--version <label> | --deployment-ref <ref>] [--expected-sha <sha>]
+  [--actor <ref>]` POSTs `/v1/map-control/deploy/publish` to pin the public URL to a chosen
+  version. `--version` is resolved to a `deployment_ref` via `routes/status`. The
+  control-plane is **review-gated** (rejects unless the version is a reviewed, succeeded
+  deploy) and **stale-safe** (with `--expected-sha`, rejects if the version's recorded source
+  SHA moved). On success it prints the published URL.
+
+`map domain` (custom-domain binding) is a separate, later slice and is not part of this CLI yet.
 
 ## Boundary
 
