@@ -51,6 +51,12 @@ enum Command {
     DeployRequest(DeployRequestArgs),
     /// Onboard an app (allowlist + host mirror + workflow drop).
     Setup(SetupArgs),
+    /// ADR-0018 (#63): list an app's addressable internal versions, its aliases, and which
+    /// internal version is currently published to the clean public URL.
+    Versions(VersionsArgs),
+    /// ADR-0018 (#63): publish a reviewed, succeeded internal version to the app's clean
+    /// public URL (review-gated + stale-safe; pins the external published pointer).
+    Publish(PublishArgs),
     Status(IdArgs),
     Watch(WatchArgs),
     Logs(IdArgs),
@@ -222,6 +228,42 @@ struct SetupArgs {
     workflow: String,
 }
 
+/// `map versions <app>` (ADR-0018 / #63 Phase 2c): list an app's per-version pointers,
+/// its aliases (production/preview/release), and which internal version the clean public
+/// URL is currently published to. Read-only — GET `/v1/map-control/routes/status`.
+#[derive(Args)]
+struct VersionsArgs {
+    /// App name (e.g. `gtd-tracker`); normalized to `app:<app>`. Accepts a literal `app:` ref.
+    app: String,
+}
+
+/// `map publish <app>` (ADR-0018 / #63 Phase 2c): pin the app's external published pointer
+/// (the clean, env-bare public URL) to a chosen healthy internal version. Resolve the version
+/// from `--deployment-ref`, or look one up by `--version <label>` (see `map versions`).
+#[derive(Args)]
+struct PublishArgs {
+    /// App name (e.g. `gtd-tracker`); normalized to `app:<app>`. Accepts a literal `app:` ref.
+    app: String,
+
+    /// Internal version label to publish (resolved to a deployment_ref via `routes/status`).
+    /// Mutually exclusive with `--deployment-ref`. Pick a label from `map versions <app>`.
+    #[arg(long, conflicts_with = "deployment_ref")]
+    version: Option<String>,
+
+    /// Explicit deployment ref to publish (skips the `--version` lookup).
+    #[arg(long = "deployment-ref")]
+    deployment_ref: Option<String>,
+
+    /// Stale-safe guard: the version must still record this exact source SHA, else the
+    /// control-plane rejects with 409 (publish precisely what was reviewed).
+    #[arg(long = "expected-sha")]
+    expected_sha: Option<String>,
+
+    /// Actor ref to attribute the publish to. The control-plane defaults one when omitted.
+    #[arg(long)]
+    actor: Option<String>,
+}
+
 #[derive(Args)]
 struct IdArgs {
     id: String,
@@ -374,6 +416,8 @@ fn run(cli: Cli) -> Result<(), String> {
             )
         }
         Command::Setup(args) => setup(&cli, args),
+        Command::Versions(args) => map_versions(&cli, args),
+        Command::Publish(args) => map_publish(&cli, args),
         Command::Status(args) => get(
             &cli,
             "/v1/map-control/deploy/status",
@@ -882,6 +926,308 @@ fn host_onboarding_steps(owner: &str, repo: &str) -> Vec<Value> {
             "command": "# reuse the org-wide github-installation://131136661 — usually no change needed"
         }),
     ]
+}
+
+// ───────────────────────── map versions / map publish (ADR-0018 #63) ─────────────────────────
+
+/// The control-plane keys every route pointer by `app:<name>`; `map versions`/`map publish` take
+/// the bare app name and normalize it (a caller may also pass a literal `app:` ref verbatim).
+fn normalize_app_ref(app: &str) -> String {
+    if app.starts_with("app:") {
+        app.to_string()
+    } else {
+        format!("app:{app}")
+    }
+}
+
+fn fetch_routes_status(cli: &Cli) -> Result<Value, String> {
+    let (http, state) = client(cli)?;
+    fetch_json(&http, &state, "/v1/map-control/routes/status")
+}
+
+/// `map versions <app>`: classify the app's route pointers from `routes/status` into addressable
+/// internal versions (`route_pointer_ref` containing `/version/<label>`), aliases (the
+/// production/preview/release `(app,env)` pointers), and the external published pointer
+/// (`published-external://…`) — the clean public URL and which internal version it serves.
+fn map_versions(cli: &Cli, args: &VersionsArgs) -> Result<(), String> {
+    let app_ref = normalize_app_ref(&args.app);
+    let routes = fetch_routes_status(cli)?;
+    let payload = versions_payload(&routes, &app_ref);
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+    } else {
+        print!("{}", render_versions_text(&payload));
+    }
+    Ok(())
+}
+
+/// Pure shape of `map versions`: filter `routes/status` `aliases` to this app and split into
+/// `versions` / `aliases` / `published`. Field names mirror the control-plane `RoutePointerRecord`
+/// (`app_ref`, `route_pointer_ref`, `current_deployment_ref`, `hostname`, `app_env`, `pinned`,
+/// `updated_from_action`). `published` is `null` when the app has never been published.
+fn versions_payload(routes: &Value, app_ref: &str) -> Value {
+    let mut versions: Vec<Value> = Vec::new();
+    let mut aliases: Vec<Value> = Vec::new();
+    let mut published = Value::Null;
+
+    if let Some(pointers) = routes.get("aliases").and_then(Value::as_object) {
+        for pointer in pointers.values() {
+            if pointer.get("app_ref").and_then(Value::as_str) != Some(app_ref) {
+                continue;
+            }
+            let pointer_ref = pointer
+                .get("route_pointer_ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let deployment_ref = pointer
+                .get("current_deployment_ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let hostname = pointer
+                .get("hostname")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            if pointer_ref.starts_with("published-external://") {
+                published = json!({
+                    "deployment_ref": deployment_ref,
+                    "hostname": hostname,
+                    "route_pointer_ref": pointer_ref,
+                });
+            } else if let Some(label) = version_label_from_ref(pointer_ref) {
+                versions.push(json!({
+                    "label": label,
+                    "deployment_ref": deployment_ref,
+                    "hostname": hostname,
+                    "app_env": pointer.get("app_env"),
+                    "platform_env": pointer.get("platform_env"),
+                    "route_pointer_ref": pointer_ref,
+                }));
+            } else {
+                aliases.push(json!({
+                    "app_env": pointer.get("app_env"),
+                    "updated_from_action": pointer.get("updated_from_action"),
+                    "deployment_ref": deployment_ref,
+                    "hostname": hostname,
+                    "pinned": pointer.get("pinned").and_then(Value::as_bool).unwrap_or(false),
+                    "route_pointer_ref": pointer_ref,
+                }));
+            }
+        }
+    }
+
+    // Stable, deterministic output regardless of the BTreeMap iteration the server happens to send.
+    versions.sort_by(|a, b| a["label"].as_str().cmp(&b["label"].as_str()));
+    aliases.sort_by(|a, b| a["app_env"].as_str().cmp(&b["app_env"].as_str()));
+
+    json!({
+        "app": app_ref.trim_start_matches("app:"),
+        "app_ref": app_ref,
+        "versions": versions,
+        "aliases": aliases,
+        "published": published,
+    })
+}
+
+/// The per-version label embedded in an immutable version pointer ref
+/// (`route-pointer://<penv>/<aenv>/<app_ref>/version/<label>`); `None` for non-version pointers.
+fn version_label_from_ref(pointer_ref: &str) -> Option<&str> {
+    pointer_ref
+        .split_once("/version/")
+        .map(|(_, label)| label)
+        .filter(|label| !label.is_empty())
+}
+
+fn render_versions_text(payload: &Value) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "app: {}\n",
+        payload["app"].as_str().unwrap_or_default()
+    ));
+
+    out.push_str("\ninternal versions:\n");
+    match payload["versions"].as_array() {
+        Some(versions) if !versions.is_empty() => {
+            for version in versions {
+                out.push_str(&format!(
+                    "  {}  {}  {}\n",
+                    version["label"].as_str().unwrap_or_default(),
+                    version["deployment_ref"].as_str().unwrap_or_default(),
+                    version["hostname"].as_str().unwrap_or_default(),
+                ));
+            }
+        }
+        _ => out.push_str("  (none)\n"),
+    }
+
+    out.push_str("\naliases:\n");
+    match payload["aliases"].as_array() {
+        Some(aliases) if !aliases.is_empty() => {
+            for alias in aliases {
+                let pinned = if alias["pinned"].as_bool().unwrap_or(false) {
+                    " [pinned]"
+                } else {
+                    ""
+                };
+                out.push_str(&format!(
+                    "  {} ({}){}  ->  {}  {}\n",
+                    alias["app_env"].as_str().unwrap_or_default(),
+                    alias["updated_from_action"].as_str().unwrap_or_default(),
+                    pinned,
+                    alias["deployment_ref"].as_str().unwrap_or_default(),
+                    alias["hostname"].as_str().unwrap_or_default(),
+                ));
+            }
+        }
+        _ => out.push_str("  (none)\n"),
+    }
+
+    out.push_str("\npublished: ");
+    if payload["published"].is_null() {
+        out.push_str("(not published)\n");
+    } else {
+        out.push_str(&format!(
+            "{}  https://{}\n",
+            payload["published"]["deployment_ref"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["published"]["hostname"]
+                .as_str()
+                .unwrap_or_default(),
+        ));
+    }
+    out
+}
+
+/// `map publish <app>`: resolve the chosen internal version to a deployment_ref, then POST
+/// `/v1/map-control/deploy/publish` to pin the app's clean public URL to it. The control-plane is
+/// review-gated (400 unless the version is a reviewed, succeeded deploy) and stale-safe (409 when
+/// `--expected-sha` no longer matches the version's recorded source SHA).
+fn map_publish(cli: &Cli, args: &PublishArgs) -> Result<(), String> {
+    let app_ref = normalize_app_ref(&args.app);
+    let deployment_ref = match &args.deployment_ref {
+        Some(deployment_ref) => deployment_ref.clone(),
+        None => {
+            let label = args.version.as_deref().ok_or_else(|| {
+                format!(
+                    "pick a version to publish: pass --version <label> or --deployment-ref <ref> (run `map versions {}` to list)",
+                    app_ref.trim_start_matches("app:")
+                )
+            })?;
+            let routes = fetch_routes_status(cli)?;
+            resolve_version_deployment_ref(&routes, &app_ref, label)?
+        }
+    };
+
+    let body = build_publish_body(
+        &app_ref,
+        &deployment_ref,
+        args.actor.as_deref(),
+        args.expected_sha.as_deref(),
+    );
+
+    let (http, state) = client(cli)?;
+    let response = http
+        .post(format!(
+            "{}/v1/map-control/deploy/publish",
+            state.map_control_endpoint.trim_end_matches('/'),
+        ))
+        .bearer_auth(&state.access_token)
+        .json(&body)
+        .send()
+        .map_err(|error| format!("MAP request failed: {error}"))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|error| format!("read MAP response: {error}"))?;
+    match status {
+        StatusCode::OK | StatusCode::CREATED | StatusCode::ACCEPTED => {}
+        StatusCode::BAD_REQUEST => {
+            return Err(format!(
+                "version not publishable: must be a reviewed, succeeded deploy ({})",
+                redact(&text)
+            ));
+        }
+        StatusCode::CONFLICT => {
+            return Err(format!(
+                "stale: the reviewed source moved; re-check `map versions` ({})",
+                redact(&text)
+            ));
+        }
+        _ => return Err(format!("MAP returned {status}: {}", redact(&text))),
+    }
+
+    if cli.json {
+        println!("{text}");
+        return Ok(());
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|error| format!("parse publish response: {error}"))?;
+    match value
+        .get("published")
+        .and_then(|published| published.get("hostname"))
+        .and_then(Value::as_str)
+    {
+        Some(hostname) => println!("published https://{hostname}"),
+        None => println!("ok"),
+    }
+    Ok(())
+}
+
+/// Look up the deployment_ref behind an internal version `label` from `routes/status` (the
+/// `current_deployment_ref` of this app's `…/version/<label>` pointer).
+fn resolve_version_deployment_ref(
+    routes: &Value,
+    app_ref: &str,
+    label: &str,
+) -> Result<String, String> {
+    if let Some(pointers) = routes.get("aliases").and_then(Value::as_object) {
+        for pointer in pointers.values() {
+            if pointer.get("app_ref").and_then(Value::as_str) != Some(app_ref) {
+                continue;
+            }
+            let pointer_ref = pointer
+                .get("route_pointer_ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if version_label_from_ref(pointer_ref) == Some(label) {
+                return pointer
+                    .get("current_deployment_ref")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        format!("version `{label}` has no current_deployment_ref in routes/status")
+                    });
+            }
+        }
+    }
+    Err(format!(
+        "no internal version labeled `{label}` for {app_ref}; run `map versions {}` to list",
+        app_ref.trim_start_matches("app:")
+    ))
+}
+
+/// The `/v1/map-control/deploy/publish` request body (a control-plane `ActionInput`). `app_ref` is
+/// carried for symmetry/audit; the handler authoritatively derives the app from the deployment.
+/// `actor_ref`/`expected_source_sha` are sent only when supplied.
+fn build_publish_body(
+    app_ref: &str,
+    deployment_ref: &str,
+    actor_ref: Option<&str>,
+    expected_source_sha: Option<&str>,
+) -> Value {
+    let mut body = json!({
+        "app_ref": app_ref,
+        "deployment_ref": deployment_ref,
+    });
+    if let Some(actor_ref) = actor_ref {
+        body["actor_ref"] = json!(actor_ref);
+    }
+    if let Some(expected_source_sha) = expected_source_sha {
+        body["expected_source_sha"] = json!(expected_source_sha);
+    }
+    body
 }
 
 // ───────────────────────────── map doctor (readiness) ─────────────────────────────
@@ -1433,5 +1779,236 @@ mod tests {
             .iter()
             .any(|check| check.level == Level::Fail);
         assert!(any_fail);
+    }
+
+    // ── map versions / map publish (ADR-0018 #63) ──
+
+    /// A representative `routes/status` payload grounded in the control-plane `RoutePointerRecord`
+    /// shape (`aliases` is a map keyed by `route_pointer_ref`): a production alias, two immutable
+    /// per-version pointers, the env-bare published-external pointer, and an unrelated app that must
+    /// be filtered out. Pointer refs/hostnames mirror the cp builders (`route_pointer_ref_for*`,
+    /// `published_external_route_pointer_ref`, `hostname_for_published_external`).
+    fn sample_routes_status() -> Value {
+        json!({
+            "status": "ok",
+            "deployments": {},
+            "aliases": {
+                "route-pointer://sandbox/production/app:gtd-tracker": {
+                    "route_pointer_ref": "route-pointer://sandbox/production/app:gtd-tracker",
+                    "app_ref": "app:gtd-tracker",
+                    "app_env": "production",
+                    "platform_env": "sandbox",
+                    "hostname": "gtd-tracker-production.sandbox.apps.mithran.cloud",
+                    "current_deployment_ref": "deployment://sandbox/production/gtd-2",
+                    "updated_from_action": "ProductionPromote",
+                    "pinned": false
+                },
+                "route-pointer://sandbox/production/app:gtd-tracker/version/gtd-2": {
+                    "route_pointer_ref": "route-pointer://sandbox/production/app:gtd-tracker/version/gtd-2",
+                    "app_ref": "app:gtd-tracker",
+                    "app_env": "production",
+                    "platform_env": "sandbox",
+                    "hostname": "gtd-tracker-gtd-2.sandbox.apps.mithran.cloud",
+                    "current_deployment_ref": "deployment://sandbox/production/gtd-2",
+                    "updated_from_action": "PreviewUpdate",
+                    "pinned": false
+                },
+                "route-pointer://sandbox/production/app:gtd-tracker/version/gtd-1": {
+                    "route_pointer_ref": "route-pointer://sandbox/production/app:gtd-tracker/version/gtd-1",
+                    "app_ref": "app:gtd-tracker",
+                    "app_env": "production",
+                    "platform_env": "sandbox",
+                    "hostname": "gtd-tracker-gtd-1.sandbox.apps.mithran.cloud",
+                    "current_deployment_ref": "deployment://sandbox/production/gtd-1",
+                    "updated_from_action": "PreviewUpdate",
+                    "pinned": false
+                },
+                "published-external://sandbox/app:gtd-tracker": {
+                    "route_pointer_ref": "published-external://sandbox/app:gtd-tracker",
+                    "app_ref": "app:gtd-tracker",
+                    "app_env": "production",
+                    "platform_env": "sandbox",
+                    "hostname": "gtd-tracker.apps.mithran.cloud",
+                    "current_deployment_ref": "deployment://sandbox/production/gtd-1",
+                    "updated_from_action": "PublishedExternal",
+                    "pinned": true
+                },
+                "published-external://sandbox/app:other-app": {
+                    "route_pointer_ref": "published-external://sandbox/app:other-app",
+                    "app_ref": "app:other-app",
+                    "app_env": "production",
+                    "platform_env": "sandbox",
+                    "hostname": "other-app.apps.mithran.cloud",
+                    "current_deployment_ref": "deployment://sandbox/production/other-9",
+                    "updated_from_action": "PublishedExternal",
+                    "pinned": true
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn normalizes_app_ref() {
+        assert_eq!(normalize_app_ref("gtd-tracker"), "app:gtd-tracker");
+        assert_eq!(normalize_app_ref("app:gtd-tracker"), "app:gtd-tracker");
+    }
+
+    #[test]
+    fn versions_payload_splits_versions_published_and_filters_other_apps() {
+        let payload = versions_payload(&sample_routes_status(), "app:gtd-tracker");
+
+        assert_eq!(payload["app"], "gtd-tracker");
+        assert_eq!(payload["app_ref"], "app:gtd-tracker");
+
+        // Both per-version pointers are surfaced, sorted by label (gtd-1 before gtd-2).
+        let versions = payload["versions"].as_array().expect("versions array");
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0]["label"], "gtd-1");
+        assert_eq!(
+            versions[0]["deployment_ref"],
+            "deployment://sandbox/production/gtd-1"
+        );
+        assert_eq!(
+            versions[0]["hostname"],
+            "gtd-tracker-gtd-1.sandbox.apps.mithran.cloud"
+        );
+        assert_eq!(versions[1]["label"], "gtd-2");
+
+        // The production alias is an alias, not a version.
+        let aliases = payload["aliases"].as_array().expect("aliases array");
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0]["app_env"], "production");
+        assert_eq!(aliases[0]["updated_from_action"], "ProductionPromote");
+
+        // The published-external pointer surfaces the env-bare hostname + the published version.
+        assert_eq!(
+            payload["published"]["deployment_ref"],
+            "deployment://sandbox/production/gtd-1"
+        );
+        assert_eq!(
+            payload["published"]["hostname"],
+            "gtd-tracker.apps.mithran.cloud"
+        );
+
+        // The unrelated app's published pointer must not leak in.
+        let rendered = render_versions_text(&payload);
+        assert!(!rendered.contains("other-app"), "must filter other apps");
+        assert!(rendered.contains("https://gtd-tracker.apps.mithran.cloud"));
+    }
+
+    #[test]
+    fn versions_payload_reports_not_published_when_no_published_pointer() {
+        let routes = json!({
+            "aliases": {
+                "route-pointer://sandbox/production/app:fresh/version/v1": {
+                    "route_pointer_ref": "route-pointer://sandbox/production/app:fresh/version/v1",
+                    "app_ref": "app:fresh",
+                    "app_env": "production",
+                    "platform_env": "sandbox",
+                    "hostname": "fresh-v1.sandbox.apps.mithran.cloud",
+                    "current_deployment_ref": "deployment://sandbox/production/v1",
+                    "updated_from_action": "PreviewUpdate",
+                    "pinned": false
+                }
+            }
+        });
+        let payload = versions_payload(&routes, "app:fresh");
+        assert!(payload["published"].is_null());
+        assert!(render_versions_text(&payload).contains("(not published)"));
+    }
+
+    #[test]
+    fn resolves_version_label_to_deployment_ref() {
+        let routes = sample_routes_status();
+        assert_eq!(
+            resolve_version_deployment_ref(&routes, "app:gtd-tracker", "gtd-2").unwrap(),
+            "deployment://sandbox/production/gtd-2"
+        );
+        // Unknown labels and other apps' labels both fail with a guiding message.
+        assert!(resolve_version_deployment_ref(&routes, "app:gtd-tracker", "nope").is_err());
+        assert!(resolve_version_deployment_ref(&routes, "app:other-app", "gtd-1").is_err());
+    }
+
+    #[test]
+    fn publish_body_has_app_ref_and_deployment_ref_and_omits_optionals() {
+        let body = build_publish_body(
+            "app:gtd-tracker",
+            "deployment://sandbox/production/gtd-1",
+            None,
+            None,
+        );
+        assert_eq!(body["app_ref"], "app:gtd-tracker");
+        assert_eq!(
+            body["deployment_ref"],
+            "deployment://sandbox/production/gtd-1"
+        );
+        // Optionals are absent (not null) so the cp's serde defaults apply.
+        assert!(body.get("expected_source_sha").is_none());
+        assert!(body.get("actor_ref").is_none());
+    }
+
+    #[test]
+    fn publish_body_includes_expected_sha_and_actor_when_given() {
+        let body = build_publish_body(
+            "app:gtd-tracker",
+            "deployment://sandbox/production/gtd-1",
+            Some("actor://user/b@mithran.ai"),
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        );
+        assert_eq!(
+            body["expected_source_sha"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(body["actor_ref"], "actor://user/b@mithran.ai");
+    }
+
+    #[test]
+    fn publish_parses_version_and_expected_sha_flags() {
+        let cli = Cli::try_parse_from([
+            "map",
+            "publish",
+            "gtd-tracker",
+            "--version",
+            "gtd-2",
+            "--expected-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Publish(args) => {
+                assert_eq!(args.app, "gtd-tracker");
+                assert_eq!(args.version.as_deref(), Some("gtd-2"));
+                assert_eq!(
+                    args.expected_sha.as_deref(),
+                    Some("0123456789abcdef0123456789abcdef01234567")
+                );
+                assert!(args.deployment_ref.is_none());
+            }
+            _ => panic!("expected publish"),
+        }
+    }
+
+    #[test]
+    fn publish_rejects_version_and_deployment_ref_together() {
+        // The two version selectors are mutually exclusive.
+        assert!(Cli::try_parse_from([
+            "map",
+            "publish",
+            "gtd-tracker",
+            "--version",
+            "gtd-2",
+            "--deployment-ref",
+            "deployment://sandbox/production/gtd-2",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn versions_parses_app_arg() {
+        let cli = Cli::try_parse_from(["map", "versions", "gtd-tracker"]).expect("parses");
+        match cli.command {
+            Command::Versions(args) => assert_eq!(args.app, "gtd-tracker"),
+            _ => panic!("expected versions"),
+        }
     }
 }
