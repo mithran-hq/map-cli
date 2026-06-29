@@ -914,6 +914,11 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
     let workflow_path = scaffold_deploy_workflow(args.repo_dir.as_ref(), &args.workflow)?;
     let manifest_path = scaffold_manifest(args.repo_dir.as_ref(), repo_name)?;
 
+    // map-cli#13: set the non-secret repo Variables the OIDC map-deploy.yml reads (no secrets —
+    // auth is GitHub OIDC). Best-effort: skips with a note if no GitHub token is available.
+    let variables = onboard_variables(args, &project_ref);
+    let variables_outcome = set_repo_variables(&args.repo, &variables);
+
     print_json_or_text(
         cli.json,
         json!({
@@ -923,7 +928,8 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
             "onboard": value,
             "workflow_written": workflow_path.as_ref().map(|p| p.display().to_string()),
             "manifest_written": manifest_path.as_ref().map(|p| p.display().to_string()),
-            "next": "commit + push the scaffolded files; set repo Variables/secret (map-cli#11) then push a release ref to deploy",
+            "variables": variables_outcome,
+            "next": "commit + push the scaffolded files, then push a release/* ref (or tag) to deploy",
         }),
         &format!(
             "onboarded {} (registry binding recorded).{}{}\nnext: commit + push the scaffold, then push a release/* ref (or tag) to deploy.",
@@ -938,6 +944,91 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
                 .unwrap_or_default(),
         ),
     )
+}
+
+/// The non-secret repo Variables the OIDC `map-deploy.yml` reads. Optional refs are set only
+/// when present (the cp may also derive tenant/account from the edge identity — cp#86).
+fn onboard_variables(args: &OnboardArgs, project_ref: &str) -> Vec<(&'static str, String)> {
+    let mut vars = vec![
+        ("MAP_INSTALLATION_REF", args.installation_ref.clone()),
+        ("MAP_APP_REF", project_ref.to_string()),
+    ];
+    if let Some(tenant) = &args.tenant_ref {
+        vars.push(("MAP_TENANT_REF", tenant.clone()));
+    }
+    if let Some(account) = &args.account_ref {
+        vars.push(("MAP_ACCOUNT_REF", account.clone()));
+    }
+    vars
+}
+
+/// Best-effort: set repo Actions Variables via the GitHub API using the dev's token. No
+/// secrets (auth is GitHub OIDC — ADR-0023). Returns a JSON summary; never fails onboard.
+fn set_repo_variables(repo: &str, vars: &[(&'static str, String)]) -> Value {
+    let token = match resolve_github_token(None) {
+        Ok(token) => token,
+        Err(_) => {
+            return json!({
+                "set": false,
+                "reason": "no GitHub token (set $GITHUB_TOKEN/$GH_TOKEN or run `gh auth login`); set the MAP_* Variables manually",
+            })
+        }
+    };
+    let client = match build_client() {
+        Ok(client) => client,
+        Err(error) => return json!({ "set": false, "reason": redact(&error) }),
+    };
+    let api_base =
+        env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".to_string());
+    let mut set: Vec<&str> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    for (name, value) in vars {
+        match set_one_repo_variable(&client, &token, &api_base, repo, name, value) {
+            Ok(()) => set.push(name),
+            Err(error) => failed.push(json!({ "name": name, "error": redact(&error) })),
+        }
+    }
+    json!({ "set": set, "failed": failed })
+}
+
+/// Create-or-update a single repo Actions Variable (POST to create; PATCH on 409-exists).
+fn set_one_repo_variable(
+    client: &Client,
+    token: &str,
+    api_base: &str,
+    repo: &str,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let base = api_base.trim_end_matches('/');
+    let create = client
+        .post(format!("{base}/repos/{repo}/actions/variables"))
+        .header("accept", "application/vnd.github+json")
+        .header("x-github-api-version", "2022-11-28")
+        .header("user-agent", "map-cli")
+        .bearer_auth(token)
+        .json(&json!({ "name": name, "value": value }))
+        .send()
+        .map_err(|error| format!("create variable {name}: {error}"))?;
+    if create.status().is_success() {
+        return Ok(());
+    }
+    if create.status() == StatusCode::CONFLICT {
+        let update = client
+            .patch(format!("{base}/repos/{repo}/actions/variables/{name}"))
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", "2022-11-28")
+            .header("user-agent", "map-cli")
+            .bearer_auth(token)
+            .json(&json!({ "name": name, "value": value }))
+            .send()
+            .map_err(|error| format!("update variable {name}: {error}"))?;
+        if update.status().is_success() {
+            return Ok(());
+        }
+        return Err(format!("update variable {name}: HTTP {}", update.status()));
+    }
+    Err(format!("create variable {name}: HTTP {}", create.status()))
 }
 
 /// Drop the deploy workflow into `<repo_dir>/.github/workflows/<workflow>` (idempotent).
@@ -1752,6 +1843,35 @@ mod tests {
     #[test]
     fn onboard_requires_installation_ref() {
         assert!(Cli::try_parse_from(["map", "onboard", "john-smith/my-app"]).is_err());
+    }
+
+    #[test]
+    fn onboard_variables_set_required_and_present_optionals_only() {
+        let args = OnboardArgs {
+            repo: "john-smith/my-app".to_string(),
+            installation_ref: "github-installation://131136661".to_string(),
+            tenant_ref: Some("tenant:john-smith".to_string()),
+            account_ref: None,
+            project_ref: None,
+            repo_dir: None,
+            workflow: "map-deploy.yml".to_string(),
+        };
+        let vars: std::collections::HashMap<&str, String> =
+            onboard_variables(&args, "app:my-app").into_iter().collect();
+        assert_eq!(
+            vars.get("MAP_INSTALLATION_REF").map(String::as_str),
+            Some("github-installation://131136661")
+        );
+        assert_eq!(
+            vars.get("MAP_APP_REF").map(String::as_str),
+            Some("app:my-app")
+        );
+        assert_eq!(
+            vars.get("MAP_TENANT_REF").map(String::as_str),
+            Some("tenant:john-smith")
+        );
+        // an absent optional ref is omitted (not set to empty).
+        assert!(!vars.contains_key("MAP_ACCOUNT_REF"));
     }
 
     #[test]
