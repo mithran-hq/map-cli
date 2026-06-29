@@ -8,20 +8,16 @@
 # work runs here — the deploy-review gate stays server-side in mithran-control-plane.
 # This workflow POSTs the deploy request to the control-plane chokepoint
 # `/v1/map-control/deploy/request`; the state machine reviews-before-build as usual.
-# (Actions-workflow triggers; supersedes the ADR-0016 webhook-ingress trigger.)
 #
-# `map setup <owner/repo> --repo-dir <checkout>` drops this file into a repo at
+# `map onboard <owner/repo> --repo-dir <checkout>` drops this file into a repo at
 # `.github/workflows/map-deploy.yml`. Keep it in sync with map-cli/templates/map-deploy.yml.
 #
-# ┌─────────────────────────────────────────────────────────────────────────────┐
-# │ ⚠ INGRESS GAP (must read).                                                   │
-# │ The control-plane listens on 127.0.0.1:4260 on the host — it is NOT          │
-# │ reachable from GitHub-hosted runners. This workflow therefore runs on a      │
-# │ SELF-HOSTED runner on the control-plane host (so localhost resolves), OR you │
-# │ must expose the control-plane through a public/webhook ingress and point     │
-# │ `MAP_CONTROL_ENDPOINT` at it. Until that ingress exists, keep `runs-on`      │
-# │ self-hosted. (Tracked under mithran-control-plane#49 / ADR-0016.)            │
-# └─────────────────────────────────────────────────────────────────────────────┘
+# AUTH (ADR-0023, keyless): the workflow authenticates to the PUBLIC control-plane edge
+# via GitHub OIDC federation — NO stored deploy secret. It requests a GitHub Actions OIDC
+# token (audience = map-control) and exchanges it at mithran-auth for a short-lived
+# map-control token, which the Envoy edge ext_authz validates. mithran-auth mints only for
+# a repo with an ACTIVE onboarding binding (so `map onboard` must have run). Runs on a
+# GitHub-hosted runner against the public edge — no co-located runner / localhost needed.
 
 name: map-deploy
 
@@ -49,27 +45,28 @@ on:
 
 permissions:
   contents: read
+  # ADR-0023: required to mint the GitHub Actions OIDC token exchanged for a map-control token.
+  id-token: write
 
 jobs:
   request-deploy:
-    # See INGRESS GAP above: must reach 127.0.0.1:4260 on the control-plane host.
-    runs-on: [self-hosted, mithran-control-plane]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      # Repo/org Variables (Settings → Variables) — non-secret routing config.
-      MAP_CONTROL_ENDPOINT: ${{ vars.MAP_CONTROL_ENDPOINT || 'http://127.0.0.1:4260' }}
+      # Public edge endpoints (Settings → Variables; defaults target the sandbox edge).
+      MAP_CONTROL_ENDPOINT: ${{ vars.MAP_CONTROL_ENDPOINT || 'https://control-plane.sandbox.mithran.cloud' }}
+      MAP_AUTH_ENDPOINT: ${{ vars.MAP_AUTH_ENDPOINT || 'https://auth.sandbox.mithran.cloud' }}
+      MAP_OIDC_AUDIENCE: ${{ vars.MAP_OIDC_AUDIENCE || 'map-control' }}
       MAP_PLATFORM_ENV: ${{ vars.MAP_PLATFORM_ENV || 'sandbox' }}
+      # Per-repo routing config (set by `map onboard`). No secrets — auth is via OIDC.
       MAP_INSTALLATION_REF: ${{ vars.MAP_INSTALLATION_REF }}
       MAP_APP_REF: ${{ vars.MAP_APP_REF }}
       MAP_TENANT_REF: ${{ vars.MAP_TENANT_REF }}
       MAP_ACCOUNT_REF: ${{ vars.MAP_ACCOUNT_REF }}
-      # The ONLY secret this workflow may carry: a control-plane caller bearer token
-      # (optional — empty when the control-plane trusts the host-local self-hosted runner).
-      MAP_CONTROL_TOKEN: ${{ secrets.MAP_CONTROL_TOKEN }}
       INPUT_ENV: ${{ inputs.env }}
       INPUT_REF: ${{ inputs.ref }}
     steps:
-      - name: POST deploy request to control-plane
+      - name: Exchange GitHub OIDC for a map-control token, then POST the deploy request
         shell: bash
         run: |
           set -euo pipefail
@@ -92,7 +89,35 @@ jobs:
           deployment_ref="deployment://${platform_env}/${app_env}/${repo##*/}-${GITHUB_RUN_ID}"
 
           if [ -z "${MAP_INSTALLATION_REF}" ]; then
-            echo "::error::MAP_INSTALLATION_REF variable is required (deploy/request rejects a missing installation_ref). Set it via 'map setup' or repo Variables." >&2
+            echo "::error::MAP_INSTALLATION_REF variable is required (deploy/request rejects a missing installation_ref). Set it via 'map onboard' or repo Variables." >&2
+            exit 1
+          fi
+
+          # ADR-0023 keyless auth: GitHub OIDC token (aud=map-control) → mithran-auth exchange
+          # → short-lived map-control token. id-token:write (above) provides the request creds.
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::no GitHub OIDC request credentials — ensure 'permissions: id-token: write'." >&2
+            exit 1
+          fi
+          oidc_token="$(curl -sS --max-time 60 \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${MAP_OIDC_AUDIENCE}" | jq -r '.value // empty')"
+          if [ -z "${oidc_token}" ]; then
+            echo "::error::failed to obtain a GitHub OIDC token." >&2
+            exit 1
+          fi
+          exchange_code="$(curl -sS --max-time 60 -o exchange.json -w '%{http_code}' \
+            -X POST "${MAP_AUTH_ENDPOINT%/}/v1/auth/github-oidc/exchange" \
+            -H 'content-type: application/json' \
+            -d "$(jq -nc --arg t "${oidc_token}" '{oidc_token:$t}')")"
+          if [ "${exchange_code}" != "200" ]; then
+            echo "::error::OIDC token exchange failed (HTTP ${exchange_code}); is ${repo} onboarded (\`map onboard\`)?" >&2
+            cat exchange.json || true
+            exit 1
+          fi
+          map_token="$(jq -r '.access_token // empty' exchange.json)"
+          if [ -z "${map_token}" ]; then
+            echo "::error::OIDC exchange returned no access_token." >&2
             exit 1
           fi
 
@@ -122,14 +147,10 @@ jobs:
 
           echo "Dispatching deploy: ${deployment_ref} (env=${app_env} ref=${requested_ref})"
 
-          auth=()
-          if [ -n "${MAP_CONTROL_TOKEN}" ]; then
-            auth=(-H "authorization: Bearer ${MAP_CONTROL_TOKEN}")
-          fi
-
           http_code="$(curl -sS --max-time 600 -o response.json -w '%{http_code}' \
             -X POST "${MAP_CONTROL_ENDPOINT%/}/v1/map-control/deploy/request" \
-            -H 'content-type: application/json' "${auth[@]}" \
+            -H 'content-type: application/json' \
+            -H "authorization: Bearer ${map_token}" \
             -d "${body}")"
 
           echo "control-plane HTTP ${http_code}"

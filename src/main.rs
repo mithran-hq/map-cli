@@ -1845,8 +1845,13 @@ mod tests {
     fn template_is_a_thin_dispatch_to_the_control_plane() {
         assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("workflow_dispatch"));
         assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("/v1/map-control/deploy/request"));
-        // Records the ingress gap: must run host-local (self-hosted) to reach :4260.
-        assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("self-hosted"));
+        // ADR-0023: keyless auth via GitHub OIDC federation (no static deploy secret).
+        assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("id-token: write"));
+        assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("/v1/auth/github-oidc/exchange"));
+        // Runs on a GitHub-hosted runner against the public edge — no self-hosted/localhost.
+        assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("runs-on: ubuntu-latest"));
+        assert!(!MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("self-hosted"));
+        assert!(!MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("MAP_CONTROL_TOKEN"));
     }
 
     #[test]
