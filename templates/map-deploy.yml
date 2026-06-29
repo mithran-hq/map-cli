@@ -1,10 +1,14 @@
-# map-deploy.yml — thin MAP deploy trigger (ADR-0016, map-cli#4).
+# map-deploy.yml — thin MAP deploy trigger.
 #
-# `map deploy --env <env> --ref <ref>` dispatches THIS workflow (workflow_dispatch).
-# GitHub is the trigger + audit/status surface ONLY. No LLM / build / heavy work
-# runs here — the deploy-review gate stays server-side in mithran-control-plane.
-# All this workflow does is POST the deploy request to the control-plane chokepoint
+# Deploys fire from THREE triggers only — NO deploy-on-every-push:
+#   • push/merge to a release branch (release/**) → production deploy of that SHA
+#   • a release tag (vX.Y.Z, semver)              → production deploy of that SHA
+#   • manual `map deploy <HEAD|SHA>`              → workflow_dispatch
+# GitHub Actions is the trigger + audit/status surface ONLY. No LLM / build / heavy
+# work runs here — the deploy-review gate stays server-side in mithran-control-plane.
+# This workflow POSTs the deploy request to the control-plane chokepoint
 # `/v1/map-control/deploy/request`; the state machine reviews-before-build as usual.
+# (Actions-workflow triggers; supersedes the ADR-0016 webhook-ingress trigger.)
 #
 # `map setup <owner/repo> --repo-dir <checkout>` drops this file into a repo at
 # `.github/workflows/map-deploy.yml`. Keep it in sync with map-cli/templates/map-deploy.yml.
@@ -22,15 +26,23 @@
 name: map-deploy
 
 on:
+  # Release line → production. A push/merge to a release branch, or a semver
+  # release tag, deploys that exact SHA. NO other branch (main, feature/*) triggers
+  # a deploy — only release branches/tags + the manual dispatch below.
+  push:
+    branches:
+      - 'release/**'
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       env:
-        description: "Target app env (preview | staging | production)"
-        required: true
-        default: preview
+        description: "Platform-internal target env (sandbox | staging | production). Operators deploy to production."
+        required: false
+        default: production
         type: string
       ref:
-        description: "Git ref or 40-hex SHA to deploy (defaults to the workflow ref)"
+        description: "Git ref or 40-hex SHA to deploy (defaults to the pushed/HEAD SHA)"
         required: false
         default: ""
         type: string
@@ -63,9 +75,20 @@ jobs:
           set -euo pipefail
 
           repo="${GITHUB_REPOSITORY}"                  # owner/repo
-          requested_ref="${INPUT_REF:-$GITHUB_REF}"    # git ref or SHA to deploy
-          app_env="${INPUT_ENV}"
           platform_env="${MAP_PLATFORM_ENV}"
+          # Trigger-aware. A release-branch / tag PUSH deploys the pushed SHA to
+          # production; manual dispatch uses the operator's env + ref. Nothing else
+          # reaches this workflow (see the `on:` filter) — no deploy-on-every-push.
+          case "${GITHUB_EVENT_NAME}" in
+            push)
+              requested_ref="${GITHUB_SHA}"
+              app_env="production"
+              ;;
+            *)  # workflow_dispatch (manual `map deploy`)
+              requested_ref="${INPUT_REF:-$GITHUB_SHA}"
+              app_env="${INPUT_ENV:-production}"
+              ;;
+          esac
           deployment_ref="deployment://${platform_env}/${app_env}/${repo##*/}-${GITHUB_RUN_ID}"
 
           if [ -z "${MAP_INSTALLATION_REF}" ]; then
