@@ -11,7 +11,7 @@ use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The reusable `map-deploy.yml` workflow template. `map setup --repo-dir` writes this
+/// The reusable `map-deploy.yml` workflow template. `map onboard --repo-dir` writes this
 /// verbatim into a repo's `.github/workflows/`; `map deploy` dispatches it. Single source
 /// of truth lives at `templates/map-deploy.yml`.
 const MAP_DEPLOY_WORKFLOW_TEMPLATE: &str = include_str!("../templates/map-deploy.yml");
@@ -49,7 +49,10 @@ enum Command {
     Deploy(DeployArgs),
     /// Host/runner-side primitive: POST a deploy request straight to the control-plane.
     DeployRequest(DeployRequestArgs),
-    /// Onboard an app (allowlist + host mirror + workflow drop).
+    /// Onboard a repo: one authenticated control-plane `/onboard` call (records the source
+    /// registry binding — P2a/P2b) + a local scaffold of the deploy workflow + manifest.
+    Onboard(OnboardArgs),
+    /// DEPRECATED: use `map onboard`. Local workflow scaffold only (no host steps, no API call).
     Setup(SetupArgs),
     /// ADR-0018 (#63): list an app's addressable internal versions, its aliases, and which
     /// internal version is currently published to the clean public URL.
@@ -152,7 +155,7 @@ struct DeployArgs {
     #[arg(long)]
     repo: Option<String>,
 
-    /// Workflow file to dispatch; must already exist in the repo (added by `map setup`).
+    /// Workflow file to dispatch; must already exist in the repo (added by `map onboard`).
     #[arg(long, default_value = "map-deploy.yml")]
     workflow: String,
 
@@ -213,13 +216,47 @@ struct DoctorArgs {
     app: Option<String>,
 }
 
-/// `map setup <owner/repo>` (map-cli#5): onboard an app.
+/// `map setup <owner/repo>` (DEPRECATED — use `map onboard`): legacy scaffold-only shim.
 #[derive(Args)]
 struct SetupArgs {
     /// Repository to onboard, `owner/repo`.
     repo: String,
 
     /// Local checkout to write `.github/workflows/<workflow>` into (idempotent).
+    #[arg(long)]
+    repo_dir: Option<PathBuf>,
+
+    /// Workflow filename written under `.github/workflows/`.
+    #[arg(long, default_value = "map-deploy.yml")]
+    workflow: String,
+}
+
+/// `map onboard <owner/repo>` (P3a, mithran-business#531): one authenticated call to the
+/// control-plane `/onboard` endpoint (records the source-registry binding — P2a/P2b) plus a
+/// local scaffold of the deploy workflow + manifest. Replaces `map setup`'s host-step printing.
+#[derive(Args)]
+struct OnboardArgs {
+    /// Repository to onboard, `owner/repo`.
+    repo: String,
+
+    /// GitHub App installation ref authorizing the repo, e.g. `github-installation://131136661`.
+    /// (Auto-resolution from the caller's identity + App grant is P3b.)
+    #[arg(long)]
+    installation_ref: String,
+
+    /// Tenant ref (provisioning identity); the control-plane records it on the binding.
+    #[arg(long)]
+    tenant_ref: Option<String>,
+
+    /// Account ref (provisioning identity).
+    #[arg(long)]
+    account_ref: Option<String>,
+
+    /// Project ref; defaults to `app:<repo-name>`.
+    #[arg(long)]
+    project_ref: Option<String>,
+
+    /// Local checkout to scaffold `.github/workflows/<workflow>` + `mithran.yaml` into.
     #[arg(long)]
     repo_dir: Option<PathBuf>,
 
@@ -415,6 +452,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 }),
             )
         }
+        Command::Onboard(args) => onboard(&cli, args),
         Command::Setup(args) => setup(&cli, args),
         Command::Versions(args) => map_versions(&cli, args),
         Command::Publish(args) => map_publish(&cli, args),
@@ -744,7 +782,7 @@ fn deploy_dispatch(cli: &Cli, args: &DeployArgs) -> Result<(), String> {
     let text = response.text().unwrap_or_default();
     if status == StatusCode::NOT_FOUND {
         return Err(format!(
-            "GitHub returned 404 for workflow `{}` on {}@{} — the workflow may be missing (run `map setup {}`, commit + push), or the repo/ref is wrong, or the token lacks access",
+            "GitHub returned 404 for workflow `{}` on {}@{} — the workflow may be missing (run `map onboard {}`, commit + push), or the repo/ref is wrong, or the token lacks access",
             args.workflow, repo, args.workflow_ref, repo
         ));
     }
@@ -817,115 +855,155 @@ fn validate_repo_slug(repo: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ───────────────────────────── map setup (onboarding) ─────────────────────────────
+// ───────────────────────────── map onboard ─────────────────────────────
 
-/// Onboard an app (map-cli#5). Two parts: (a) drop the `map-deploy.yml` workflow into a
-/// local checkout when `--repo-dir` is given; (b) print the host-local onboarding steps
-/// (allowlist + bare-mirror create + `map-mirror-sync`) the operator/automation must run.
+/// `map onboard <owner/repo>` (P3a). One authenticated call to the control-plane `/onboard`
+/// endpoint records the source-registry binding (P2a/P2b) — so the repo passes the source
+/// broker allowlist with no restart — then scaffolds the deploy workflow + a starter manifest
+/// into `--repo-dir`. Supersedes `map setup`'s host-step printing.
 ///
-/// DEFERRED: the host steps exist only because there is no control-plane `onboard` endpoint
-/// yet — the CLI has no host access, so it cannot create the mirror or edit the allowlist
-/// itself. The proper fix (flagged on map-cli#5) is a single authenticated `onboard` API
-/// call (allowlist via durable drop-in + broker-driven mirror create + installation
-/// allowlist), so `map setup` stops printing host commands and just calls one endpoint.
-fn setup(cli: &Cli, args: &SetupArgs) -> Result<(), String> {
+/// Scope: registry binding + scaffold. Setting repo Variables (`MAP_*`) + the `MAP_CONTROL_TOKEN`
+/// secret via the GitHub API is a focused follow-up (map-cli#11). Auto-resolving the installation
+/// from the caller's identity + App grant is P3b (mithran-control-plane#79).
+fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
     validate_repo_slug(&args.repo)?;
-    let (owner, repo_name) = args.repo.split_once('/').expect("validated owner/repo");
+    let (_owner, repo_name) = args.repo.split_once('/').expect("validated owner/repo");
+    let repository_ref = format!("github://{}", args.repo);
+    let project_ref = args
+        .project_ref
+        .clone()
+        .unwrap_or_else(|| format!("app:{repo_name}"));
 
-    let mut workflow_path: Option<PathBuf> = None;
-    if let Some(repo_dir) = &args.repo_dir {
-        let dir = repo_dir.join(".github").join("workflows");
-        fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
-        let path = dir.join(&args.workflow);
-        fs::write(&path, MAP_DEPLOY_WORKFLOW_TEMPLATE)
-            .map_err(|error| format!("write {}: {error}", path.display()))?;
-        workflow_path = Some(path);
-    }
+    let (client, state) = client(cli)?;
+    let response = client
+        .post(format!(
+            "{}/v1/map-control/onboard",
+            state.map_control_endpoint.trim_end_matches('/')
+        ))
+        .bearer_auth(&state.access_token)
+        .json(&json!({
+            "repository_ref": repository_ref,
+            "installation_ref": args.installation_ref,
+            "tenant_ref": args.tenant_ref,
+            "account_ref": args.account_ref,
+            "project_ref": project_ref,
+        }))
+        .send()
+        .map_err(|error| format!("onboard request failed: {error}"))?;
 
-    let steps = host_onboarding_steps(owner, repo_name);
-
-    if cli.json {
-        let payload = json!({
-            "ok": true,
-            "schema_version": "map.setup.v1",
-            "repo": args.repo,
-            "workflow_written": workflow_path.as_ref().map(|path| path.display().to_string()),
-            "host_steps": steps,
-            "deferred": {
-                "onboard_endpoint": "no control-plane `onboard` endpoint yet; host steps are printed for an operator/automation to run (map-cli#5)",
-                "broker_mirror_create": "broker should create the bare mirror in the source phase; `map-mirror-sync` only REFRESHES an existing one (map-cli#5)",
-                "durable_allowlist": "prefer a systemd drop-in / provisioning template over a manual service.env edit (ADR-0016, mithran-auth#93)"
-            }
-        });
-        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
-        return Ok(());
-    }
-
-    match &workflow_path {
-        Some(path) => println!("wrote {} ({})", path.display(), args.workflow),
-        None => println!(
-            "(no --repo-dir given; skipped workflow drop — pass --repo-dir <checkout> to write .github/workflows/{})",
-            args.workflow
-        ),
-    }
-    println!();
-    println!(
-        "Host onboarding for {} — run on the control-plane host (no `onboard` API yet):",
-        args.repo
-    );
-    for (index, step) in steps.iter().enumerate() {
-        println!(
-            "  {}. {}",
-            index + 1,
-            step["title"].as_str().unwrap_or_default()
-        );
-        if let Some(command) = step["command"].as_str() {
-            println!("       {command}");
+    let status = response.status();
+    let value: Value = response.json().unwrap_or_else(|_| json!({}));
+    // The repo grant is missing — guide the developer to finish the GitHub App install/grant,
+    // then re-run (onboard is idempotent). (Server-side grant verification lands in cp#84.)
+    if status == StatusCode::CONFLICT {
+        if let Some(url) = value.get("install_url").and_then(Value::as_str) {
+            return Err(format!(
+                "GitHub App grant required for {}: install/grant it at {} then re-run `map onboard`",
+                args.repo, url
+            ));
         }
+        return Err(format!("onboard conflict: {}", redact(&value.to_string())));
     }
-    println!();
-    println!("DEFERRED (map-cli#5): replace the host steps above with a control-plane `onboard` endpoint");
-    println!("  so `map setup` is one authenticated API call — durable allowlist (drop-in, not service.env),");
-    println!("  broker-driven bare-mirror create (today `map-mirror-sync` only REFRESHES), installation allowlist.");
-    Ok(())
+    if !status.is_success() {
+        return Err(format!(
+            "onboard returned {status}: {}",
+            redact(&value.to_string())
+        ));
+    }
+
+    let workflow_path = scaffold_deploy_workflow(args.repo_dir.as_ref(), &args.workflow)?;
+    let manifest_path = scaffold_manifest(args.repo_dir.as_ref(), repo_name)?;
+
+    print_json_or_text(
+        cli.json,
+        json!({
+            "ok": true,
+            "schema_version": "map.onboard.v1",
+            "repo": args.repo,
+            "onboard": value,
+            "workflow_written": workflow_path.as_ref().map(|p| p.display().to_string()),
+            "manifest_written": manifest_path.as_ref().map(|p| p.display().to_string()),
+            "next": "commit + push the scaffolded files; set repo Variables/secret (map-cli#11) then push a release ref to deploy",
+        }),
+        &format!(
+            "onboarded {} (registry binding recorded).{}{}\nnext: commit + push the scaffold, then push a release/* ref (or tag) to deploy.",
+            args.repo,
+            workflow_path
+                .as_ref()
+                .map(|p| format!("\nwrote {}", p.display()))
+                .unwrap_or_else(|| "\n(no --repo-dir; skipped workflow scaffold)".to_string()),
+            manifest_path
+                .as_ref()
+                .map(|p| format!("\nwrote {}", p.display()))
+                .unwrap_or_default(),
+        ),
+    )
 }
 
-/// The host-local onboarding commands, faithful to the clean-room runbook §2.
-fn host_onboarding_steps(owner: &str, repo: &str) -> Vec<Value> {
-    let slug = format!("{owner}/{repo}");
-    let mirror = format!("/var/lib/map-source-repos/{owner}/{repo}.git");
-    vec![
+/// Drop the deploy workflow into `<repo_dir>/.github/workflows/<workflow>` (idempotent).
+fn scaffold_deploy_workflow(
+    repo_dir: Option<&PathBuf>,
+    workflow: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(repo_dir) = repo_dir else {
+        return Ok(None);
+    };
+    let dir = repo_dir.join(".github").join("workflows");
+    fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    let path = dir.join(workflow);
+    fs::write(&path, MAP_DEPLOY_WORKFLOW_TEMPLATE)
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    Ok(Some(path))
+}
+
+/// Write a starter `<repo_dir>/mithran.yaml` if one is not already present (never clobbers).
+fn scaffold_manifest(repo_dir: Option<&PathBuf>, name: &str) -> Result<Option<PathBuf>, String> {
+    let Some(repo_dir) = repo_dir else {
+        return Ok(None);
+    };
+    let path = repo_dir.join("mithran.yaml");
+    if path.exists() {
+        return Ok(None);
+    }
+    fs::write(
+        &path,
+        format!("schema_version: mithran.map.v1\nname: {name}\n"),
+    )
+    .map_err(|error| format!("write {}: {error}", path.display()))?;
+    Ok(Some(path))
+}
+
+/// DEPRECATED (`map setup`): use `map onboard`. Kept as a local scaffold-only shim — it writes
+/// the deploy workflow but does NOT call the control-plane (it cannot supply the installation
+/// ref) and no longer prints the host onboarding wall (superseded by the `/onboard` endpoint).
+fn setup(cli: &Cli, args: &SetupArgs) -> Result<(), String> {
+    validate_repo_slug(&args.repo)?;
+    eprintln!(
+        "map: `map setup` is deprecated; use `map onboard <owner/repo> --installation-ref <ref>`."
+    );
+    let workflow_path = scaffold_deploy_workflow(args.repo_dir.as_ref(), &args.workflow)?;
+    print_json_or_text(
+        cli.json,
         json!({
-            "title": "Allowlist the repo (durable: prefer a systemd drop-in over editing service.env)",
-            "command": format!(
-                "sudo sed -i \"s#\\(MAP_LIVE_SOURCE_ALLOWED_REPOSITORIES=.*\\)#\\1,github://{slug}#\" /etc/mithran-control-plane/service.env"
-            )
+            "ok": true,
+            "schema_version": "map.setup.v1",
+            "deprecated": "use `map onboard`",
+            "repo": args.repo,
+            "workflow_written": workflow_path.as_ref().map(|p| p.display().to_string()),
         }),
-        json!({
-            "title": "Create the host-local bare source mirror (first-time; map-mirror-sync only REFRESHES)",
-            "command": format!("sudo -u mithran-control-plane git init --bare -q {mirror}")
-        }),
-        json!({
-            "title": "Point the mirror at GitHub (map-mirror-sync's `git remote set-url` needs an existing origin)",
-            "command": format!("sudo -u mithran-control-plane git -C {mirror} remote add origin https://github.com/{slug}.git")
-        }),
-        json!({
-            "title": "Sync the mirror with a minted GitHub-App installation token",
-            "command": format!("sudo map-mirror-sync {slug}")
-        }),
-        json!({
-            "title": "Restart the control-plane so it reloads the allowlist",
-            "command": "sudo systemctl restart mithran-control-plane"
-        }),
-        json!({
-            "title": "Verify the repo is allowlisted (the count should increase)",
-            "command": "curl -s :4260/v1/map-control/config | jq .source_snapshot_storage.live_source_broker.allowed_repository_count"
-        }),
-        json!({
-            "title": "installation_ref must be in MAP_LIVE_SOURCE_ALLOWED_INSTALLATIONS",
-            "command": "# reuse the org-wide github-installation://131136661 — usually no change needed"
-        }),
-    ]
+        &match &workflow_path {
+            Some(path) => format!(
+                "wrote {} ({}). Deprecated: run `map onboard {} --installation-ref <ref>` to record the registry binding.",
+                path.display(),
+                args.workflow,
+                args.repo
+            ),
+            None => format!(
+                "(no --repo-dir; nothing written). Deprecated: use `map onboard {} --installation-ref <ref>`.",
+                args.repo
+            ),
+        },
+    )
 }
 
 // ───────────────────────── map versions / map publish (ADR-0018 #63) ─────────────────────────
@@ -1400,11 +1478,17 @@ fn adapter_check(config: &Value) -> Check {
 }
 
 fn allowlist_count(config: &Value) -> Option<u64> {
-    config
+    let broker = config
         .get("source_snapshot_storage")?
-        .get("live_source_broker")?
-        .get("allowed_repository_count")?
-        .as_u64()
+        .get("live_source_broker")?;
+    let env_count = broker.get("allowed_repository_count")?.as_u64()?;
+    // P2a: the hot registry is the live authority for onboarded repos; count its bindings too
+    // so doctor reflects repos onboarded via `map onboard` (not just the env bootstrap seed).
+    let registry_count = broker
+        .get("registry_binding_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(env_count + registry_count)
 }
 
 fn allowlist_check(config: &Value) -> Check {
@@ -1412,7 +1496,7 @@ fn allowlist_check(config: &Value) -> Check {
         Some(0) => Check::fail(
             "source allowlist",
             "0 repositories allowlisted",
-            "onboard a repo with `map setup <owner/repo>` (allowlist + mirror)",
+            "onboard a repo with `map onboard <owner/repo> --installation-ref <ref>`",
         ),
         Some(count) => Check::ok(
             "source allowlist",
@@ -1443,12 +1527,12 @@ fn app_allowlist_check(allowlist_count: Option<u64>, has_deployment: bool, app: 
         Some(0) => Check::fail(
             "app allowlisted",
             format!("no repositories allowlisted — {app} cannot deploy"),
-            format!("run `map setup {app}`"),
+            format!("run `map onboard {app} --installation-ref <ref>`"),
         ),
         _ => Check::warn(
             "app allowlisted",
             format!("cannot confirm {app} is allowlisted (the config endpoint exposes only a count, not the list)"),
-            format!("run `map setup {app}` or verify the host allowlist; a control-plane allowlist-membership query would let doctor check this directly"),
+            format!("run `map onboard {app} --installation-ref <ref>`; doctor counts registry bindings (P2a) so an onboarded repo shows here"),
         ),
     }
 }
@@ -1470,7 +1554,7 @@ fn app_route_check(has_alias: bool, has_deployment: bool, app: &str) -> Check {
         Check::warn(
             "app route/alias",
             format!("no deployment or route alias found for {app}"),
-            format!("after `map setup {app}`, deploy with `map deploy --env preview --repo {app}`"),
+            format!("after `map onboard {app} --installation-ref <ref>`, deploy with `map deploy --env preview --repo {app}`"),
         )
     }
 }
@@ -1636,6 +1720,90 @@ mod tests {
             }
             _ => panic!("expected setup"),
         }
+    }
+
+    #[test]
+    fn onboard_parses_repo_and_installation_with_optionals() {
+        let cli = Cli::try_parse_from([
+            "map",
+            "onboard",
+            "john-smith/my-app",
+            "--installation-ref",
+            "github-installation://131136661",
+            "--tenant-ref",
+            "tenant:john-smith",
+            "--repo-dir",
+            "/tmp/x",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Onboard(args) => {
+                assert_eq!(args.repo, "john-smith/my-app");
+                assert_eq!(args.installation_ref, "github-installation://131136661");
+                assert_eq!(args.tenant_ref.as_deref(), Some("tenant:john-smith"));
+                assert_eq!(args.project_ref, None);
+                assert_eq!(args.repo_dir, Some(PathBuf::from("/tmp/x")));
+                assert_eq!(args.workflow, "map-deploy.yml");
+            }
+            _ => panic!("expected onboard"),
+        }
+    }
+
+    #[test]
+    fn onboard_requires_installation_ref() {
+        assert!(Cli::try_parse_from(["map", "onboard", "john-smith/my-app"]).is_err());
+    }
+
+    #[test]
+    fn scaffold_helpers_write_and_do_not_clobber() {
+        let dir = env::temp_dir().join(format!("map-onboard-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let wf = scaffold_deploy_workflow(Some(&dir), "map-deploy.yml")
+            .expect("ok")
+            .expect("path");
+        assert!(wf.ends_with("map-deploy.yml"));
+        assert_eq!(
+            fs::read_to_string(&wf).unwrap(),
+            MAP_DEPLOY_WORKFLOW_TEMPLATE
+        );
+
+        let manifest = scaffold_manifest(Some(&dir), "my-app")
+            .expect("ok")
+            .expect("path");
+        let body = fs::read_to_string(&manifest).unwrap();
+        assert!(body.contains("schema_version: mithran.map.v1"));
+        assert!(body.contains("name: my-app"));
+
+        // existing manifest is never clobbered.
+        fs::write(&manifest, "name: edited-by-user\n").unwrap();
+        assert_eq!(scaffold_manifest(Some(&dir), "my-app").expect("ok"), None);
+        assert_eq!(
+            fs::read_to_string(&manifest).unwrap(),
+            "name: edited-by-user\n"
+        );
+
+        // no --repo-dir → no-op.
+        assert_eq!(
+            scaffold_deploy_workflow(None, "map-deploy.yml").unwrap(),
+            None
+        );
+        assert_eq!(scaffold_manifest(None, "my-app").unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowlist_count_sums_env_and_registry_bindings() {
+        let config = json!({
+            "source_snapshot_storage": {
+                "live_source_broker": {
+                    "allowed_repository_count": 1,
+                    "registry_binding_count": 2
+                }
+            }
+        });
+        assert_eq!(allowlist_count(&config), Some(3));
     }
 
     #[test]
