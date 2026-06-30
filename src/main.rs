@@ -54,6 +54,10 @@ enum Command {
     Onboard(OnboardArgs),
     /// DEPRECATED: use `map onboard`. Local workflow scaffold only (no host steps, no API call).
     Setup(SetupArgs),
+    /// ADR-0019 (app access & sharing): declare who can reach a protected app as code in
+    /// `access.yaml`, then reconcile it into the control-plane. `apply` takes effect hot
+    /// (next deploy route push); `plan` prints the resolved policy without applying.
+    Access(AccessArgs),
     /// ADR-0018 (#63): list an app's addressable internal versions, its aliases, and which
     /// internal version is currently published to the clean public URL.
     Versions(VersionsArgs),
@@ -265,6 +269,48 @@ struct OnboardArgs {
     workflow: String,
 }
 
+#[derive(Args)]
+struct AccessArgs {
+    #[command(subcommand)]
+    command: AccessSubcommand,
+}
+
+#[derive(Subcommand)]
+enum AccessSubcommand {
+    /// Reconcile the app's `access.yaml` into the control-plane (hot — enforced on the next
+    /// deploy route push, no rollout).
+    Apply(AccessApplyArgs),
+    /// Print the resolved access policy without applying it (no control-plane call).
+    Plan(AccessApplyArgs),
+}
+
+#[derive(Args)]
+struct AccessApplyArgs {
+    /// Directory containing `access.yaml` (default: current directory).
+    #[arg(long)]
+    repo_dir: Option<PathBuf>,
+
+    /// Explicit path to the access file (overrides `--repo-dir`/`access.yaml`).
+    #[arg(long)]
+    file: Option<PathBuf>,
+
+    /// App ref to apply to; overrides `app_ref` in `access.yaml`. Required if the file omits it.
+    #[arg(long)]
+    app_ref: Option<String>,
+
+    /// Tenant ref; overrides `tenant_ref` in `access.yaml`.
+    #[arg(long)]
+    tenant_ref: Option<String>,
+
+    /// Account ref; overrides `account_ref` in `access.yaml`.
+    #[arg(long)]
+    account_ref: Option<String>,
+
+    /// Exposure (`public` | `protected`); overrides `exposure` in `access.yaml`.
+    #[arg(long)]
+    exposure: Option<String>,
+}
+
 /// `map versions <app>` (ADR-0018 / #63 Phase 2c): list an app's per-version pointers,
 /// its aliases (production/preview/release), and which internal version the clean public
 /// URL is currently published to. Read-only — GET `/v1/map-control/routes/status`.
@@ -454,6 +500,10 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Onboard(args) => onboard(&cli, args),
         Command::Setup(args) => setup(&cli, args),
+        Command::Access(args) => match &args.command {
+            AccessSubcommand::Apply(apply) => access_apply(&cli, apply),
+            AccessSubcommand::Plan(plan) => access_plan(&cli, plan),
+        },
         Command::Versions(args) => map_versions(&cli, args),
         Command::Publish(args) => map_publish(&cli, args),
         Command::Status(args) => get(
@@ -944,6 +994,127 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
                 .unwrap_or_default(),
         ),
     )
+}
+
+/// ADR-0019: the `access.yaml` schema — an app's access policy declared as code. Every field
+/// is optional in the file; `app_ref` must be resolvable (file or `--app-ref`). Unknown keys
+/// are rejected so a typo (e.g. `allowed_domain`) fails loudly instead of silently widening or
+/// narrowing access.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccessFile {
+    #[serde(default)]
+    app_ref: Option<String>,
+    #[serde(default)]
+    tenant_ref: Option<String>,
+    #[serde(default)]
+    account_ref: Option<String>,
+    /// `public` (anyone) | `protected` (signed-in + policy). Defaults to `protected` when a
+    /// policy is declared as code.
+    #[serde(default)]
+    exposure: Option<String>,
+    /// Google-Workspace domains admitted in full (matched on the part after `@`).
+    #[serde(default)]
+    allowed_domains: Vec<String>,
+    /// Explicitly named principals (email or `account:` ref).
+    #[serde(default)]
+    share: Vec<String>,
+}
+
+/// The fully resolved access policy (file merged with CLI overrides), ready to apply or print.
+#[derive(Debug)]
+struct ResolvedAccessPolicy {
+    app_ref: String,
+    body: Value,
+}
+
+/// Resolve `access.yaml` (or `--file`) merged with CLI overrides into the request body the
+/// control-plane's `/v1/map-control/access` endpoint expects. CLI flags win over file values.
+fn resolve_access_policy(args: &AccessApplyArgs) -> Result<ResolvedAccessPolicy, String> {
+    let path = args.file.clone().unwrap_or_else(|| {
+        args.repo_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("access.yaml")
+    });
+    let raw = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "could not read access file {}: {error} (create access.yaml or pass --file)",
+            path.display()
+        )
+    })?;
+    let file: AccessFile = serde_yaml::from_str(&raw)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+
+    let app_ref = args
+        .app_ref
+        .clone()
+        .or(file.app_ref)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "no app_ref: set it in access.yaml or pass --app-ref app:<name>".to_string()
+        })?;
+    // Declaring an access policy as code implies a protected app; only an explicit `public`
+    // opts back out.
+    let exposure = args
+        .exposure
+        .clone()
+        .or(file.exposure)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "protected".to_string());
+    if exposure != "public" && exposure != "protected" {
+        return Err(format!(
+            "exposure must be 'public' or 'protected', got '{exposure}'"
+        ));
+    }
+    let tenant_ref = args.tenant_ref.clone().or(file.tenant_ref);
+    let account_ref = args.account_ref.clone().or(file.account_ref);
+
+    let mut body = json!({
+        "app_ref": app_ref,
+        "exposure": exposure,
+        "allowed_domains": file.allowed_domains,
+        "share": file.share,
+    });
+    if let Some(tenant) = tenant_ref {
+        body["tenant_ref"] = json!(tenant);
+    }
+    if let Some(account) = account_ref {
+        body["account_ref"] = json!(account);
+    }
+    Ok(ResolvedAccessPolicy { app_ref, body })
+}
+
+/// `map access apply`: reconcile the resolved policy into the control-plane (hot).
+fn access_apply(cli: &Cli, args: &AccessApplyArgs) -> Result<(), String> {
+    let resolved = resolve_access_policy(args)?;
+    post(cli, "/v1/map-control/access", resolved.body)
+}
+
+/// `map access plan`: print the resolved policy without applying it (no control-plane call).
+fn access_plan(cli: &Cli, args: &AccessApplyArgs) -> Result<(), String> {
+    let resolved = resolve_access_policy(args)?;
+    let summary = format!(
+        "would apply access for {}:\n  exposure: {}\n  allowed_domains: {}\n  share: {}",
+        resolved.app_ref,
+        resolved.body["exposure"].as_str().unwrap_or_default(),
+        format_str_list(&resolved.body["allowed_domains"]),
+        format_str_list(&resolved.body["share"]),
+    );
+    print_json_or_text(cli.json, resolved.body, &summary)
+}
+
+fn format_str_list(value: &Value) -> String {
+    match value.as_array() {
+        Some(items) if !items.is_empty() => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "(none)".to_string(),
+    }
 }
 
 /// The non-secret repo Variables the OIDC `map-deploy.yml` reads. Optional refs are set only
@@ -1704,6 +1875,79 @@ fn emit_doctor(cli: &Cli, checks: &[Check]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn access_args_for(file: &PathBuf) -> AccessApplyArgs {
+        AccessApplyArgs {
+            repo_dir: None,
+            file: Some(file.clone()),
+            app_ref: None,
+            tenant_ref: None,
+            account_ref: None,
+            exposure: None,
+        }
+    }
+
+    fn write_access_file(name: &str, body: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("map-access-{}-{}.yaml", std::process::id(), name));
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    // ADR-0019: access.yaml resolves into the control-plane request body; a declared policy
+    // defaults to protected and carries the domains + share verbatim.
+    #[test]
+    fn resolve_access_policy_reads_file_and_defaults_protected() {
+        let path = write_access_file(
+            "basic",
+            "app_ref: app:developer-portal\nallowed_domains:\n  - mithran.ai\nshare:\n  - guest@partner.com\n",
+        );
+        let resolved = resolve_access_policy(&access_args_for(&path)).unwrap();
+        assert_eq!(resolved.app_ref, "app:developer-portal");
+        assert_eq!(resolved.body["exposure"], "protected");
+        assert_eq!(resolved.body["allowed_domains"][0], "mithran.ai");
+        assert_eq!(resolved.body["share"][0], "guest@partner.com");
+        fs::remove_file(&path).ok();
+    }
+
+    // CLI flags override file values.
+    #[test]
+    fn resolve_access_policy_cli_overrides_file() {
+        let path = write_access_file("override", "app_ref: app:from-file\nexposure: protected\n");
+        let mut args = access_args_for(&path);
+        args.app_ref = Some("app:from-flag".to_string());
+        args.exposure = Some("public".to_string());
+        let resolved = resolve_access_policy(&args).unwrap();
+        assert_eq!(resolved.app_ref, "app:from-flag");
+        assert_eq!(resolved.body["exposure"], "public");
+        fs::remove_file(&path).ok();
+    }
+
+    // A typo'd key fails loudly instead of silently dropping a restriction.
+    #[test]
+    fn resolve_access_policy_rejects_unknown_field() {
+        let path = write_access_file("typo", "app_ref: app:x\nallowed_domain:\n  - mithran.ai\n");
+        let err = resolve_access_policy(&access_args_for(&path)).unwrap_err();
+        assert!(err.contains("invalid"), "got: {err}");
+        fs::remove_file(&path).ok();
+    }
+
+    // No resolvable app_ref is an error, not a silent no-op.
+    #[test]
+    fn resolve_access_policy_requires_app_ref() {
+        let path = write_access_file("noapp", "allowed_domains:\n  - mithran.ai\n");
+        let err = resolve_access_policy(&access_args_for(&path)).unwrap_err();
+        assert!(err.contains("app_ref"), "got: {err}");
+        fs::remove_file(&path).ok();
+    }
+
+    // A bad exposure is rejected before any control-plane call.
+    #[test]
+    fn resolve_access_policy_rejects_bad_exposure() {
+        let path = write_access_file("badexp", "app_ref: app:x\nexposure: internal\n");
+        let err = resolve_access_policy(&access_args_for(&path)).unwrap_err();
+        assert!(err.contains("exposure"), "got: {err}");
+        fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn recognizes_every_control_plane_terminal_phase() {
