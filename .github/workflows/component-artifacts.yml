@@ -1,0 +1,77 @@
+name: macOS Component Artifacts
+
+# Durable, immutable GitHub Release assets for the MAP CLI (`map`), consumed by
+# the aegis Daily Dogfood Release via component-pins (aegis ADR-0022 / aegis#980).
+# Per-commit, per-family tag (`map-cli-macos/<sha>`) + SHA256SUMS.txt so the pin
+# resolves indefinitely and never expires with the 90-day actions artifacts.
+#
+# arm64-only, fail-closed (aegis ADR-0034): `map` ships for Apple Silicon only.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  map-cli-macos-component:
+    name: MAP CLI macOS Component
+    runs-on: macos-14  # GitHub-hosted Apple Silicon (arm64)
+    timeout-minutes: 30
+    permissions:
+      contents: write  # publish durable component Release assets (ADR 0022)
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Install stable Rust with macOS arm64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build map for macOS arm64
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: cargo build --release --bin map --target aarch64-apple-darwin
+
+      - name: Package macOS arm64 component artifact
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: |
+          SHA="$(git rev-parse --short HEAD)"
+          REF="git:$(git rev-parse HEAD)"
+          python3 scripts/package_host_component.py \
+            --binary target/aarch64-apple-darwin/release/map \
+            --target-arch aarch64 --version "$SHA" --source-ref "$REF" \
+            --output-dir dist/map-cli
+
+      - name: Upload component artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: map-cli-macos-component-artifacts
+          path: dist/map-cli/*.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+
+      # ADR 0022: durable, immutable Release assets so the pin never expires.
+      # Per-commit, per-family tag; SHA256SUMS.txt recorded for the consume/re-pin
+      # side. Immutable = first-publish-wins. macOS runner -> shasum(1).
+      - name: Publish durable Release assets
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="map-cli-macos/${GITHUB_SHA}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists (immutable); leaving assets untouched."
+          else
+            ( cd dist/map-cli && shasum -a 256 -- *.tar.gz > SHA256SUMS.txt )
+            gh release create "$tag" \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "map-cli macOS component ${GITHUB_SHA:0:12}" \
+              --notes "Durable macOS MAP CLI (\`map\`) component assets (ADR 0022 / aegis#980). Immutable per commit; consumed via aegis component-pins by tag + sha256."
+            gh release upload "$tag" dist/map-cli/*.tar.gz dist/map-cli/SHA256SUMS.txt
+          fi
