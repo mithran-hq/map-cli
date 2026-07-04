@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write  # publish durable component Release assets (ADR 0022)
+      id-token: write  # OIDC token for build-provenance attestation (aegis#1063)
+      attestations: write  # record build provenance for the pinned macOS asset
     steps:
       - name: Check out
         uses: actions/checkout@v5
@@ -54,6 +56,17 @@ jobs:
           path: dist/map-cli/*.tar.gz
           retention-days: 90
           if-no-files-found: error
+
+      # aegis#1063: attest build provenance for the durable macOS aarch64 asset so
+      # the aegis consume/re-pin side can `gh attestation verify` it fail-closed.
+      # Placed after the tarball is built and before the durable publish; gated on
+      # main to match the publish step (attestations require the OIDC token + the
+      # per-commit release that only exists on main).
+      - name: Attest build provenance
+        if: github.ref == 'refs/heads/main'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/map-cli/*.tar.gz
 
       # ADR 0022: durable, immutable Release assets so the pin never expires.
       # Per-commit, per-family tag; SHA256SUMS.txt recorded for the consume/re-pin
