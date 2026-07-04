@@ -62,8 +62,9 @@ jobs:
       # Placed after the tarball is built and before the durable publish; gated on
       # main to match the publish step (attestations require the OIDC token + the
       # per-commit release that only exists on main).
+      # GATED off until the operator enables ATTESTATION_ENABLED (aegis#1097): GH Artifact Attestations need a plan upgrade for private repos; unconditional attest fails before publish.
       - name: Attest build provenance
-        if: github.ref == 'refs/heads/main'
+        if: vars.ATTESTATION_ENABLED == 'true' && github.ref == 'refs/heads/main'
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/map-cli/*.tar.gz
