@@ -22,8 +22,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write  # publish durable component Release assets (ADR 0022)
-      id-token: write  # OIDC token for build-provenance attestation (aegis#1063)
-      attestations: write  # record build provenance for the pinned macOS asset
     steps:
       - name: Check out
         uses: actions/checkout@v5
@@ -57,18 +55,6 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-      # aegis#1063: attest build provenance for the durable macOS aarch64 asset so
-      # the aegis consume/re-pin side can `gh attestation verify` it fail-closed.
-      # Placed after the tarball is built and before the durable publish; gated on
-      # main to match the publish step (attestations require the OIDC token + the
-      # per-commit release that only exists on main).
-      # GATED off until the operator enables ATTESTATION_ENABLED (aegis#1097): GH Artifact Attestations need a plan upgrade for private repos; unconditional attest fails before publish.
-      - name: Attest build provenance
-        if: vars.ATTESTATION_ENABLED == 'true' && github.ref == 'refs/heads/main'
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: dist/map-cli/*.tar.gz
-
       # ADR 0022: durable, immutable Release assets so the pin never expires.
       # Per-commit, per-family tag; SHA256SUMS.txt recorded for the consume/re-pin
       # side. Immutable = first-publish-wins. macOS runner -> shasum(1).
@@ -76,16 +62,53 @@ jobs:
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
+          # Self-signed component provenance (aegis#1110): durable Ed25519 signing
+          # key (org secret scoped to component repos). Empty when unprovisioned ->
+          # signing is skipped and the release still publishes SHA256SUMS.txt.
+          AEGIS_COMPONENT_SIGNING_KEY: ${{ secrets.AEGIS_COMPONENT_SIGNING_KEY }}
         run: |
           tag="map-cli-macos/${GITHUB_SHA}"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists (immutable); leaving assets untouched."
           else
-            ( cd dist/map-cli && shasum -a 256 -- *.tar.gz > SHA256SUMS.txt )
+            ( cd dist/map-cli || exit 1
+              shasum -a 256 -- *.tar.gz > SHA256SUMS.txt
+              # Self-signed component provenance (aegis#1110): detached raw Ed25519
+              # signature over the exact SHA256SUMS.txt bytes. Inert until the org secret
+              # AEGIS_COMPONENT_SIGNING_KEY is provisioned; a release without it still
+              # publishes SHA256SUMS.txt and does not fail. Verified aegis-side with
+              # `openssl pkeyutl -verify -pubin -rawin -sigfile SHA256SUMS.txt.sig`.
+              if [ -n "${AEGIS_COMPONENT_SIGNING_KEY:-}" ]; then
+                # Resolve an OpenSSL 3.x `openssl` (only 3.x has `pkeyutl -rawin`). macOS system
+                # openssl is LibreSSL and lacks it; prefer Homebrew openssl@3 when present.
+                openssl_bin=""
+                if command -v brew >/dev/null 2>&1; then
+                  brew_openssl="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"
+                  if [ -x "$brew_openssl" ] && "$brew_openssl" version 2>/dev/null | grep -qE '^OpenSSL [3-9]'; then
+                    openssl_bin="$brew_openssl"
+                  fi
+                fi
+                if [ -z "$openssl_bin" ] && command -v openssl >/dev/null 2>&1 && openssl version 2>/dev/null | grep -qE '^OpenSSL [3-9]'; then
+                  openssl_bin=openssl
+                fi
+                if [ -n "$openssl_bin" ]; then
+                  # A real signing failure here is a hard error (fails the release, by design).
+                  printf '%s\n' "$AEGIS_COMPONENT_SIGNING_KEY" > "$RUNNER_TEMP/component-signing.key"
+                  "$openssl_bin" pkeyutl -sign -inkey "$RUNNER_TEMP/component-signing.key" -rawin -in SHA256SUMS.txt -out SHA256SUMS.txt.sig
+                  rm -f "$RUNNER_TEMP/component-signing.key"
+                else
+                  # Capability gap (e.g. a self-hosted runner without openssl@3): degrade
+                  # gracefully. Producer signs best-effort; the aegis consumer's required mode
+                  # blocks anything unsigned at re-pin, so a skipped signature is caught
+                  # downstream, never a silent gap. Still publish SHA256SUMS.txt (unsigned).
+                  echo "::warning::component-signing skipped: no OpenSSL 3.x on this runner; SHA256SUMS.txt published unsigned - consumer required-mode will flag it"
+                fi
+              fi
+            )
             gh release create "$tag" \
               --prerelease \
               --target "$GITHUB_SHA" \
               --title "map-cli macOS component ${GITHUB_SHA:0:12}" \
               --notes "Durable macOS MAP CLI (\`map\`) component assets (ADR 0022 / aegis#980). Immutable per commit; consumed via aegis component-pins by tag + sha256."
-            gh release upload "$tag" dist/map-cli/*.tar.gz dist/map-cli/SHA256SUMS.txt
+            gh release upload "$tag" dist/map-cli/*.tar.gz dist/map-cli/SHA256SUMS.txt*
           fi
