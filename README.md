@@ -16,14 +16,16 @@ map login save \
   --scope map:* \
   --scope audience:jason-controller
 
-# Onboard an app: drop the deploy workflow + print the host onboarding steps.
-map setup mithran-hq/demo --repo-dir ./demo
+# Onboard an app: record the source-registry binding + scaffold mithran.yaml.
+# Webhook-native — no repo workflow is written (add --with-ci-workflow for BYO-CI).
+map onboard mithran-hq/demo --installation-ref github-installation://131136661 --repo-dir ./demo
 
 # Diagnose readiness against the saved control-plane endpoint.
 map doctor --app mithran-hq/demo
 
-# Trigger a deploy (ADR-0016): dispatch the thin GitHub Actions workflow.
-map deploy --env staging --ref refs/heads/main --repo mithran-hq/demo
+# Trigger a deploy (ADR-0016, webhook-native): direct brokered call to the control-plane.
+map deploy --repo mithran-hq/demo --env staging --ref refs/heads/release/1.2 \
+  --installation-ref github-installation://131136661 --app-ref app:demo
 
 # List an app's addressable internal versions + which one is published (ADR-0018).
 map versions demo
@@ -38,21 +40,26 @@ Jason can reuse the MAP login by asking for a controller token:
 map login print-token --audience jason-controller
 ```
 
-## Deploy model (ADR-0016)
+## Deploy model (ADR-0016, webhook-native amendment 2026-07-06 — mithran-business#582)
 
-`map deploy [--env --ref --repo]` does **not** call the control-plane directly. The
-control-plane listens on `127.0.0.1:4260` on the host and is not reachable from
-GitHub-hosted runners. `map deploy` instead **dispatches** a thin
-`.github/workflows/map-deploy.yml` workflow (`workflow_dispatch`, via the GitHub API using
-your `gh`/GitHub token); that workflow — running on a self-hosted runner on the host (or a
-public ingress) — POSTs the deploy request to `/v1/map-control/deploy/request`. GitHub is
-the trigger + audit surface; the deploy-review gate stays server-side.
+SCM integration is **webhook-native** (the Vercel model). The per-env GitHub App
+installation + webhook is the primary deploy trigger: a `git push` to a matching ref is
+HMAC-verified by the sidecar and forwarded to the control-plane
+`/v1/map-control/deploy/request` — **no workflow file lives in the tenant repo**, and there
+is no per-repo deploy secret. The deploy-review gate stays server-side (ADR-0014); GitHub is
+a trigger + audit surface, never the gate.
 
-- `map setup <owner/repo>` adds that workflow to a repo and prints the host onboarding steps
-  (allowlist + bare-mirror create + `map-mirror-sync`). The host steps are printed because
-  there is no control-plane `onboard` endpoint yet (see map-cli#5).
-- `map deploy-request` is the host/runner-side primitive that POSTs straight to the
-  control-plane — only usable where `:4260` is reachable (host-local or via a tunnel).
+- `map deploy` / `map deploy-request` POST **directly** to the control-plane
+  `/v1/map-control/deploy/request` using your saved `map-control` login token (the same call;
+  `deploy-request` is the explicit host/runner-side spelling). Reachable wherever the
+  control-plane endpoint is — the public authenticated edge, or host-local `:4260` / a tunnel.
+  No GitHub Actions workflow is dispatched.
+- `map onboard <owner/repo> --installation-ref <ref>` records the source-registry binding and
+  scaffolds a starter `mithran.yaml`. It writes **no** repo workflow by default.
+- **Opt-in BYO-CI (ADR-0023):** pass `--with-ci-workflow` to `map onboard` to also scaffold
+  the keyless-OIDC `.github/workflows/map-deploy.yml` (`curl` → OIDC token exchange →
+  `/deploy/request`) and set the `MAP_*` repo Variables it reads. This is for tenants who want
+  to trigger deploys from their own CI; it is not needed for the default webhook path.
 
 ## Publish model (ADR-0018)
 
