@@ -44,11 +44,12 @@ enum Command {
     Doctor(DoctorArgs),
     Init(InitArgs),
     Validate(DeployTarget),
-    /// ADR-0016 trigger: dispatch the thin `map-deploy.yml` workflow (GitHub is the
-    /// trigger + audit surface; review stays server-side).
-    Deploy(DeployArgs),
-    /// Host/runner-side primitive: POST a deploy request straight to the control-plane.
-    DeployRequest(DeployRequestArgs),
+    /// ADR-0016 (amended 2026-07-06 → webhook-native): POST the deploy request straight to the
+    /// control-plane `/v1/map-control/deploy/request` using the saved `map-control` login token.
+    /// GitHub is not in the trigger path; the server-side review gate is unchanged. The
+    /// `deploy-request` alias is the explicit host/runner-side spelling of the same call.
+    #[command(alias = "deploy-request")]
+    Deploy(DeployRequestArgs),
     /// Onboard a repo: one authenticated control-plane `/onboard` call (records the source
     /// registry binding — P2a/P2b) + a local scaffold of the deploy workflow + manifest.
     Onboard(OnboardArgs),
@@ -138,48 +139,12 @@ struct DeployTarget {
     sha: Option<String>,
 }
 
-/// `map deploy` (ADR-0016 / map-cli#4): dispatch the thin `map-deploy.yml` workflow via
-/// the GitHub API (`workflow_dispatch`) using the user's GitHub token. This NEVER calls the
-/// control-plane directly — the control-plane listens on 127.0.0.1:4260 on the host and is
-/// not reachable from GitHub-hosted runners. The dispatched workflow (which runs on a
-/// self-hosted runner on the host, or via a public ingress — see templates/map-deploy.yml)
-/// is what POSTs `/v1/map-control/deploy/request`. For the host-local direct call use
-/// `map deploy-request`.
-#[derive(Args)]
-struct DeployArgs {
-    /// Target app env (preview | staging | production). Passed as a workflow input.
-    #[arg(long)]
-    env: String,
-
-    /// Git ref or 40-hex SHA to deploy (workflow input). Defaults to `--workflow-ref`.
-    #[arg(long = "ref")]
-    ref_name: Option<String>,
-
-    /// Target repository `owner/repo`. Inferred from the git `origin` remote when omitted.
-    #[arg(long)]
-    repo: Option<String>,
-
-    /// Workflow file to dispatch; must already exist in the repo (added by `map onboard`).
-    #[arg(long, default_value = "map-deploy.yml")]
-    workflow: String,
-
-    /// Git ref the workflow file lives on (the dispatch ref).
-    #[arg(long, default_value = "main")]
-    workflow_ref: String,
-
-    /// GitHub token. Falls back to $GITHUB_TOKEN, then $GH_TOKEN, then `gh auth token`.
-    #[arg(long)]
-    github_token: Option<String>,
-
-    /// GitHub API base URL (GHE). Falls back to $GITHUB_API_URL, then api.github.com.
-    #[arg(long)]
-    github_api_base: Option<String>,
-}
-
-/// `map deploy-request`: the host/runner-side primitive that POSTs straight to the
-/// control-plane `/v1/map-control/deploy/request` (what `map-deploy.yml` does via curl).
-/// Only works where the control-plane endpoint is reachable (host-local :4260 or a tunnel).
-/// `--repo` accepts a bare `owner/repo` (normalized to `github://owner/repo`) or a full ref.
+/// `map deploy` (ADR-0016, amended 2026-07-06 → webhook-native): POST straight to the
+/// control-plane `/v1/map-control/deploy/request` using the saved `map-control` login token —
+/// no GitHub Actions workflow in the trigger path. Reachable wherever the control-plane
+/// endpoint is (the public authenticated edge, or host-local :4260 / a tunnel). `--repo`
+/// accepts a bare `owner/repo` (normalized to `github://owner/repo`) or a full ref. The
+/// `deploy-request` alias is the explicit host/runner-side spelling of the same call.
 #[derive(Args, Serialize)]
 struct DeployRequestArgs {
     #[command(flatten)]
@@ -470,34 +435,7 @@ fn run(cli: Cli) -> Result<(), String> {
             validate_target(target)?;
             print_json_or_text(cli.json, json!({ "ok": true }), "target is valid")
         }
-        Command::Deploy(args) => deploy_dispatch(&cli, args),
-        Command::DeployRequest(args) => {
-            validate_target(&args.target)?;
-            // The control-plane matches the allowlist on `github://owner/repo`; accept a bare
-            // `owner/repo` and normalize it (a caller may also pass a full ref verbatim).
-            let repository_ref = if args.target.repo.contains("://") {
-                args.target.repo.clone()
-            } else {
-                format!("github://{}", args.target.repo)
-            };
-            post(
-                &cli,
-                "/v1/map-control/deploy/request",
-                json!({
-                    "deployment_ref": args.deployment_ref,
-                    "repository_ref": repository_ref,
-                    "installation_ref": args.installation_ref,
-                    "app_ref": args.app_ref,
-                    "app_env": args.target.env,
-                    "tenant_ref": args.tenant_ref,
-                    "account_ref": args.account_ref,
-                    "platform_env": args.platform_env,
-                    "requested_ref": args.target.ref_name,
-                    "source_sha": args.target.sha,
-                    "authority_evidence_ref": args.evidence_ref,
-                }),
-            )
-        }
+        Command::Deploy(args) => deploy_request(&cli, args),
         Command::Onboard(args) => onboard(&cli, args),
         Command::Setup(args) => setup(&cli, args),
         Command::Access(args) => match &args.command {
@@ -752,94 +690,38 @@ fn redact(text: &str) -> String {
     redacted
 }
 
-// ───────────────────────────── map deploy (workflow_dispatch) ─────────────────────────────
+// ─────────────────────── map deploy (direct brokered control-plane call) ───────────────────────
 
-/// Dispatch the thin `map-deploy.yml` workflow (ADR-0016 / map-cli#4). We POST a
-/// `workflow_dispatch` to the GitHub API with the user's GitHub token; the deployed ref +
-/// env ride along as workflow inputs. The control-plane is host-local (127.0.0.1:4260) and
-/// unreachable from Actions, so this command deliberately does NOT talk to it — the
-/// dispatched workflow does, from a self-hosted runner on the host (or a public ingress).
-fn deploy_dispatch(cli: &Cli, args: &DeployArgs) -> Result<(), String> {
-    let repo = match &args.repo {
-        Some(repo) => repo.clone(),
-        None => infer_repo_from_git()
-            .ok_or("could not infer --repo from git `origin`; pass --repo <owner/repo>")?,
+/// `map deploy` / `map deploy-request` (ADR-0016, amended 2026-07-06 → webhook-native): POST the
+/// deploy request straight to the control-plane `/v1/map-control/deploy/request` with the saved
+/// `map-control` login token. No GitHub Actions workflow is dispatched — GitHub is not in the
+/// trigger path. The server-side review gate (ADR-0014) is unchanged.
+fn deploy_request(cli: &Cli, args: &DeployRequestArgs) -> Result<(), String> {
+    validate_target(&args.target)?;
+    // The control-plane matches the allowlist on `github://owner/repo`; accept a bare
+    // `owner/repo` and normalize it (a caller may also pass a full ref verbatim).
+    let repository_ref = if args.target.repo.contains("://") {
+        args.target.repo.clone()
+    } else {
+        format!("github://{}", args.target.repo)
     };
-    validate_repo_slug(&repo)?;
-
-    // Empty when --ref is omitted: the workflow input defaults to "" and the template falls
-    // back to $GITHUB_REF (the dispatch ref), rather than a bare branch name.
-    let deploy_ref = args.ref_name.clone().unwrap_or_default();
-    let token = resolve_github_token(args.github_token.as_deref())?;
-    let api_base = args
-        .github_api_base
-        .clone()
-        .or_else(|| env::var("GITHUB_API_URL").ok())
-        .unwrap_or_else(|| "https://api.github.com".to_string());
-
-    let url = format!(
-        "{}/repos/{}/actions/workflows/{}/dispatches",
-        api_base.trim_end_matches('/'),
-        repo,
-        args.workflow,
-    );
-    let body = json!({
-        "ref": args.workflow_ref,
-        "inputs": { "env": args.env, "ref": deploy_ref },
-    });
-
-    let response = build_client()?
-        .post(&url)
-        .header("accept", "application/vnd.github+json")
-        .header("x-github-api-version", "2022-11-28")
-        .bearer_auth(&token)
-        .json(&body)
-        .send()
-        .map_err(|error| format!("workflow_dispatch failed: {error}"))?;
-
-    let status = response.status();
-    if status == StatusCode::NO_CONTENT {
-        let runs_url = format!(
-            "https://github.com/{}/actions/workflows/{}",
-            repo, args.workflow
-        );
-        return print_json_or_text(
-            cli.json,
-            json!({
-                "ok": true,
-                "dispatched": true,
-                "repo": repo,
-                "workflow": args.workflow,
-                "workflow_ref": args.workflow_ref,
-                "env": args.env,
-                "ref": deploy_ref,
-                "runs_url": runs_url,
-            }),
-            &format!(
-                "dispatched {} on {} (env={}, ref={}); watch the run at {}",
-                args.workflow,
-                repo,
-                args.env,
-                if deploy_ref.is_empty() {
-                    "(dispatch ref)"
-                } else {
-                    &deploy_ref
-                },
-                runs_url
-            ),
-        );
-    }
-    let text = response.text().unwrap_or_default();
-    if status == StatusCode::NOT_FOUND {
-        return Err(format!(
-            "GitHub returned 404 for workflow `{}` on {}@{} — the workflow may be missing (run `map onboard {}`, commit + push), or the repo/ref is wrong, or the token lacks access",
-            args.workflow, repo, args.workflow_ref, repo
-        ));
-    }
-    Err(format!(
-        "GitHub workflow_dispatch returned {status}: {}",
-        redact(&text)
-    ))
+    post(
+        cli,
+        "/v1/map-control/deploy/request",
+        json!({
+            "deployment_ref": args.deployment_ref,
+            "repository_ref": repository_ref,
+            "installation_ref": args.installation_ref,
+            "app_ref": args.app_ref,
+            "app_env": args.target.env,
+            "tenant_ref": args.tenant_ref,
+            "account_ref": args.account_ref,
+            "platform_env": args.platform_env,
+            "requested_ref": args.target.ref_name,
+            "source_sha": args.target.sha,
+            "authority_evidence_ref": args.evidence_ref,
+        }),
+    )
 }
 
 /// Resolve a GitHub token from (in order): the flag, $GITHUB_TOKEN, $GH_TOKEN, `gh auth token`.
@@ -871,30 +753,6 @@ fn resolve_github_token(explicit: Option<&str>) -> Result<String, String> {
         "no GitHub token: pass --github-token, set $GITHUB_TOKEN/$GH_TOKEN, or run `gh auth login`"
             .to_string(),
     )
-}
-
-/// Best-effort `owner/repo` from the local git `origin` remote.
-fn infer_repo_from_git() -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_repo_slug(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// Extract `owner/repo` from a GitHub remote URL (ssh, https, or scp-like), trimming `.git`.
-fn parse_repo_slug(url: &str) -> Option<String> {
-    let after = url.trim().rsplit_once("github.com")?.1;
-    let path = after.trim_start_matches([':', '/']);
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let (owner, repo) = path.trim_end_matches('/').split_once('/')?;
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-        return None;
-    }
-    Some(format!("{owner}/{repo}"))
 }
 
 fn validate_repo_slug(repo: &str) -> Result<(), String> {
@@ -2005,32 +1863,42 @@ mod tests {
     }
 
     #[test]
-    fn deploy_parses_dispatch_args_with_defaults() {
+    fn deploy_parses_into_a_direct_control_plane_request() {
         let cli = Cli::try_parse_from([
             "map",
             "deploy",
-            "--env",
-            "staging",
             "--repo",
             "mithran-hq/demo",
+            "--env",
+            "staging",
             "--ref",
             "refs/heads/release/1.2",
+            "--installation-ref",
+            "github-installation://131136661",
+            "--app-ref",
+            "app:demo",
         ])
         .expect("parses");
         match cli.command {
             Command::Deploy(args) => {
-                assert_eq!(args.env, "staging");
-                assert_eq!(args.repo.as_deref(), Some("mithran-hq/demo"));
-                assert_eq!(args.ref_name.as_deref(), Some("refs/heads/release/1.2"));
-                assert_eq!(args.workflow, "map-deploy.yml");
-                assert_eq!(args.workflow_ref, "main");
+                assert_eq!(args.target.repo, "mithran-hq/demo");
+                assert_eq!(args.target.env.as_deref(), Some("staging"));
+                assert_eq!(
+                    args.target.ref_name.as_deref(),
+                    Some("refs/heads/release/1.2")
+                );
+                assert_eq!(
+                    args.installation_ref.as_deref(),
+                    Some("github-installation://131136661")
+                );
+                assert_eq!(args.app_ref.as_deref(), Some("app:demo"));
             }
             _ => panic!("expected deploy"),
         }
     }
 
     #[test]
-    fn deploy_request_is_a_distinct_subcommand() {
+    fn deploy_request_is_an_alias_for_deploy() {
         let cli = Cli::try_parse_from([
             "map",
             "deploy-request",
@@ -2040,7 +1908,7 @@ mod tests {
             "refs/heads/main",
         ])
         .expect("parses");
-        assert!(matches!(cli.command, Command::DeployRequest(_)));
+        assert!(matches!(cli.command, Command::Deploy(_)));
     }
 
     #[test]
@@ -2178,23 +2046,6 @@ mod tests {
             Command::Doctor(args) => assert_eq!(args.app.as_deref(), Some("mithran-hq/demo")),
             _ => panic!("expected doctor"),
         }
-    }
-
-    #[test]
-    fn parses_repo_slug_from_ssh_https_and_scp() {
-        for url in [
-            "git@github.com:mithran-hq/demo.git",
-            "https://github.com/mithran-hq/demo.git",
-            "https://github.com/mithran-hq/demo",
-            "ssh://git@github.com/mithran-hq/demo.git\n",
-        ] {
-            assert_eq!(
-                parse_repo_slug(url).as_deref(),
-                Some("mithran-hq/demo"),
-                "{url}"
-            );
-        }
-        assert_eq!(parse_repo_slug("https://gitlab.com/x/y.git"), None);
     }
 
     #[test]
