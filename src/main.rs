@@ -11,9 +11,10 @@ use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The reusable `map-deploy.yml` workflow template. `map onboard --repo-dir` writes this
-/// verbatim into a repo's `.github/workflows/`; `map deploy` dispatches it. Single source
-/// of truth lives at `templates/map-deploy.yml`.
+/// The reusable `map-deploy.yml` workflow template — the OPT-IN BYO-CI keyless-OIDC deploy path
+/// (ADR-0023). `map onboard --with-ci-workflow --repo-dir` writes it into a repo's
+/// `.github/workflows/`; it is NOT installed by default (webhook-native — ADR-0016 amendment
+/// 2026-07-06, mithran-business#582). Single source of truth: `templates/map-deploy.yml`.
 const MAP_DEPLOY_WORKFLOW_TEMPLATE: &str = include_str!("../templates/map-deploy.yml");
 
 const USER_AGENT: &str = concat!("map-cli/", env!("CARGO_PKG_VERSION"));
@@ -191,18 +192,24 @@ struct SetupArgs {
     /// Repository to onboard, `owner/repo`.
     repo: String,
 
-    /// Local checkout to write `.github/workflows/<workflow>` into (idempotent).
+    /// Local checkout to write `.github/workflows/<workflow>` into, with `--with-ci-workflow`.
     #[arg(long)]
     repo_dir: Option<PathBuf>,
 
-    /// Workflow filename written under `.github/workflows/`.
+    /// Workflow filename written under `.github/workflows/` when `--with-ci-workflow` is set.
     #[arg(long, default_value = "map-deploy.yml")]
     workflow: String,
+
+    /// Opt in to scaffolding the BYO-CI deploy workflow (off by default; see `map onboard`).
+    #[arg(long, default_value_t = false)]
+    with_ci_workflow: bool,
 }
 
 /// `map onboard <owner/repo>` (P3a, mithran-business#531): one authenticated call to the
 /// control-plane `/onboard` endpoint (records the source-registry binding — P2a/P2b) plus a
-/// local scaffold of the deploy workflow + manifest. Replaces `map setup`'s host-step printing.
+/// local `mithran.yaml` scaffold. Webhook-native by default (no repo workflow — the App
+/// installation is the deploy trigger); `--with-ci-workflow` opts into the BYO-CI OIDC deploy
+/// workflow (ADR-0023). Replaces `map setup`'s host-step printing.
 #[derive(Args)]
 struct OnboardArgs {
     /// Repository to onboard, `owner/repo`.
@@ -225,13 +232,20 @@ struct OnboardArgs {
     #[arg(long)]
     project_ref: Option<String>,
 
-    /// Local checkout to scaffold `.github/workflows/<workflow>` + `mithran.yaml` into.
+    /// Local checkout to scaffold `mithran.yaml` (and, with `--with-ci-workflow`, the deploy
+    /// workflow) into.
     #[arg(long)]
     repo_dir: Option<PathBuf>,
 
-    /// Workflow filename written under `.github/workflows/`.
+    /// Workflow filename written under `.github/workflows/` when `--with-ci-workflow` is set.
     #[arg(long, default_value = "map-deploy.yml")]
     workflow: String,
+
+    /// Opt in to the BYO-CI path (ADR-0023): also scaffold the keyless-OIDC deploy workflow and
+    /// set the `MAP_*` repo Variables it reads. Off by default — the webhook (App installation)
+    /// is the deploy trigger and needs no repo workflow (ADR-0016 amendment, webhook-native).
+    #[arg(long, default_value_t = false)]
+    with_ci_workflow: bool,
 }
 
 #[derive(Args)]
@@ -819,13 +833,28 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
         ));
     }
 
-    let workflow_path = scaffold_deploy_workflow(args.repo_dir.as_ref(), &args.workflow)?;
     let manifest_path = scaffold_manifest(args.repo_dir.as_ref(), repo_name)?;
 
-    // map-cli#13: set the non-secret repo Variables the OIDC map-deploy.yml reads (no secrets —
-    // auth is GitHub OIDC). Best-effort: skips with a note if no GitHub token is available.
-    let variables = onboard_variables(args, &project_ref);
-    let variables_outcome = set_repo_variables(&args.repo, &variables);
+    // Webhook-native default (ADR-0016 amendment): the App installation + webhook is the deploy
+    // trigger, so onboard writes NO repo workflow and touches no repo Actions config — zero repo
+    // footprint. `--with-ci-workflow` opts into the BYO-CI keyless-OIDC path (ADR-0023): scaffold
+    // map-deploy.yml + set the non-secret `MAP_*` repo Variables the workflow reads.
+    let (workflow_path, variables_outcome) = if args.with_ci_workflow {
+        let workflow_path = scaffold_deploy_workflow(args.repo_dir.as_ref(), &args.workflow)?;
+        let variables = onboard_variables(args, &project_ref);
+        (workflow_path, set_repo_variables(&args.repo, &variables))
+    } else {
+        (
+            None,
+            json!({ "set": false, "reason": "webhook-native default; pass --with-ci-workflow for the BYO-CI OIDC path" }),
+        )
+    };
+
+    let next = if args.with_ci_workflow {
+        "commit + push the scaffolded workflow + mithran.yaml, then push a release/* ref (or tag) to deploy"
+    } else {
+        "commit + push mithran.yaml, then push a release/* ref (or tag) — the webhook deploys (no repo workflow needed)"
+    };
 
     print_json_or_text(
         cli.json,
@@ -834,22 +863,24 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
             "schema_version": "map.onboard.v1",
             "repo": args.repo,
             "onboard": value,
+            "ci_workflow": args.with_ci_workflow,
             "workflow_written": workflow_path.as_ref().map(|p| p.display().to_string()),
             "manifest_written": manifest_path.as_ref().map(|p| p.display().to_string()),
             "variables": variables_outcome,
-            "next": "commit + push the scaffolded files, then push a release/* ref (or tag) to deploy",
+            "next": next,
         }),
         &format!(
-            "onboarded {} (registry binding recorded).{}{}\nnext: commit + push the scaffold, then push a release/* ref (or tag) to deploy.",
+            "onboarded {} (registry binding recorded).{}{}\nnext: {}.",
             args.repo,
             workflow_path
                 .as_ref()
                 .map(|p| format!("\nwrote {}", p.display()))
-                .unwrap_or_else(|| "\n(no --repo-dir; skipped workflow scaffold)".to_string()),
+                .unwrap_or_default(),
             manifest_path
                 .as_ref()
                 .map(|p| format!("\nwrote {}", p.display()))
                 .unwrap_or_default(),
+            next,
         ),
     )
 }
@@ -1101,7 +1132,12 @@ fn setup(cli: &Cli, args: &SetupArgs) -> Result<(), String> {
     eprintln!(
         "map: `map setup` is deprecated; use `map onboard <owner/repo> --installation-ref <ref>`."
     );
-    let workflow_path = scaffold_deploy_workflow(args.repo_dir.as_ref(), &args.workflow)?;
+    // Webhook-native default: scaffold nothing unless the BYO-CI opt-in is requested.
+    let workflow_path = if args.with_ci_workflow {
+        scaffold_deploy_workflow(args.repo_dir.as_ref(), &args.workflow)?
+    } else {
+        None
+    };
     print_json_or_text(
         cli.json,
         json!({
@@ -1947,6 +1983,8 @@ mod tests {
                 assert_eq!(args.project_ref, None);
                 assert_eq!(args.repo_dir, Some(PathBuf::from("/tmp/x")));
                 assert_eq!(args.workflow, "map-deploy.yml");
+                // Webhook-native default: no repo workflow scaffolded unless opted in.
+                assert!(!args.with_ci_workflow);
             }
             _ => panic!("expected onboard"),
         }
@@ -1955,6 +1993,23 @@ mod tests {
     #[test]
     fn onboard_requires_installation_ref() {
         assert!(Cli::try_parse_from(["map", "onboard", "john-smith/my-app"]).is_err());
+    }
+
+    #[test]
+    fn onboard_with_ci_workflow_opts_into_the_byo_ci_path() {
+        let cli = Cli::try_parse_from([
+            "map",
+            "onboard",
+            "john-smith/my-app",
+            "--installation-ref",
+            "github-installation://131136661",
+            "--with-ci-workflow",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Onboard(args) => assert!(args.with_ci_workflow),
+            _ => panic!("expected onboard"),
+        }
     }
 
     #[test]
@@ -1967,6 +2022,7 @@ mod tests {
             project_ref: None,
             repo_dir: None,
             workflow: "map-deploy.yml".to_string(),
+            with_ci_workflow: false,
         };
         let vars: std::collections::HashMap<&str, String> =
             onboard_variables(&args, "app:my-app").into_iter().collect();
