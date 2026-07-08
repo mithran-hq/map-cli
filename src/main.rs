@@ -1598,6 +1598,7 @@ fn map_canary(cli: &Cli, args: &CanaryArgs) -> Result<(), String> {
     let value: Value =
         serde_json::from_str(&text).map_err(|error| format!("parse canary response: {error}"))?;
     print!("{}", render_canary_text(&request, &value));
+    validate_canary_alias_app(&request, &value)?;
     Ok(())
 }
 
@@ -1703,6 +1704,12 @@ fn render_canary_text(request: &CanaryRequest, response: &Value) -> String {
         .unwrap_or("(not returned)");
     let canary = alias.get("canary_deployment_ref").and_then(Value::as_str);
     let canary_weight = alias.get("canary_weight_pct").and_then(Value::as_u64);
+    let alias_app_ref = canary_alias_app_ref(response);
+    let alias_app_mismatch = alias_app_ref
+        .as_deref()
+        .filter(|app_ref| *app_ref != request.app_ref.as_str())
+        .map(|app_ref| format!("requested {} but alias returned {app_ref}", request.app_ref))
+        .unwrap_or_else(|| "no".to_string());
     let result = match request.action {
         "start" => {
             if let Some(weight) = canary_weight.or(request.weight_pct.map(u64::from)) {
@@ -1720,14 +1727,60 @@ fn render_canary_text(request: &CanaryRequest, response: &Value) -> String {
     };
 
     format!(
-        "action: {action}\nstatus: {status}\napp: {app}\napp_ref: {app_ref}\ncanary_deployment_ref: {deployment_ref}\nalias: {route_pointer_ref}\nhostname: {hostname}\ncurrent_deployment_ref: {current}\nactive_canary: {active_canary}\nresult: {result}\n",
+        "action: {action}\nstatus: {status}\napp: {app} (requested)\napp_ref: {app_ref} (requested)\nalias_app_ref: {alias_app_ref}\nalias_app_mismatch: {alias_app_mismatch}\ncanary_deployment_ref: {deployment_ref}\nalias: {route_pointer_ref}\nhostname: {hostname}\ncurrent_deployment_ref: {current}\nactive_canary: {active_canary}\nresult: {result}\n",
         action = response_action,
         status = status,
         app = request.app,
         app_ref = request.app_ref,
+        alias_app_ref = alias_app_ref
+            .as_deref()
+            .unwrap_or("(not returned; app/app_ref above are requested)"),
+        alias_app_mismatch = alias_app_mismatch,
         deployment_ref = request.deployment_ref,
         active_canary = canary.unwrap_or("(none)"),
     )
+}
+
+fn validate_canary_alias_app(request: &CanaryRequest, response: &Value) -> Result<(), String> {
+    if let Some(alias_app_ref) = canary_alias_app_ref(response) {
+        if alias_app_ref != request.app_ref {
+            return Err(format!(
+                "canary response alias app mismatch: requested {}, alias returned {alias_app_ref}",
+                request.app_ref
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canary_alias_app_ref(response: &Value) -> Option<String> {
+    let alias = response.get("alias")?;
+    for field in ["app_ref", "project_ref"] {
+        if let Some(app_ref) = alias.get(field).and_then(Value::as_str) {
+            let app_ref = app_ref.trim();
+            if app_ref.starts_with("app:") {
+                return Some(app_ref.to_string());
+            }
+        }
+    }
+    if let Some(app) = alias.get("app").and_then(Value::as_str) {
+        let app = app.trim();
+        if !app.is_empty() {
+            return Some(normalize_app_ref(app));
+        }
+    }
+    alias
+        .get("route_pointer_ref")
+        .and_then(Value::as_str)
+        .and_then(app_ref_from_route_pointer_ref)
+}
+
+fn app_ref_from_route_pointer_ref(route_pointer_ref: &str) -> Option<String> {
+    route_pointer_ref
+        .split('/')
+        .rev()
+        .find(|segment| segment.starts_with("app:"))
+        .map(ToString::to_string)
 }
 
 // ───────────────────────────── map doctor (readiness) ─────────────────────────────
@@ -3040,11 +3093,53 @@ mod tests {
         let text = render_canary_text(&request, &response);
         assert!(text.contains("action: canary-start"));
         assert!(text.contains("status: ok"));
-        assert!(text.contains("app: gtd-tracker"));
+        assert!(text.contains("app: gtd-tracker (requested)"));
+        assert!(text.contains("app_ref: app:gtd-tracker (requested)"));
+        assert!(text.contains("alias_app_ref: app:gtd-tracker"));
+        assert!(text.contains("alias_app_mismatch: no"));
         assert!(text.contains("canary_deployment_ref: deployment://sandbox/production/gtd-2"));
         assert!(text.contains("alias: route-pointer://sandbox/production/app:gtd-tracker"));
         assert!(text.contains("hostname: gtd-tracker.apps.mithran.cloud"));
         assert!(text.contains("result: 20% canary, 80% current"));
+        assert!(validate_canary_alias_app(&request, &response).is_ok());
+    }
+
+    #[test]
+    fn canary_text_reports_alias_app_mismatch_and_validation_fails() {
+        let request = CanaryRequest {
+            action: "start",
+            app: "gtd-tracker".to_string(),
+            app_ref: "app:gtd-tracker".to_string(),
+            deployment_ref: "deployment://sandbox/production/gtd-2".to_string(),
+            weight_pct: Some(20),
+            body: json!({}),
+        };
+        let response = json!({
+            "status": "ok",
+            "action": "canary-start",
+            "alias": {
+                "route_pointer_ref": "route-pointer://sandbox/production/app:billing",
+                "hostname": "billing.apps.mithran.cloud",
+                "current_deployment_ref": "deployment://sandbox/production/billing-1",
+                "canary_deployment_ref": "deployment://sandbox/production/gtd-2",
+                "canary_weight_pct": 20
+            }
+        });
+
+        let text = render_canary_text(&request, &response);
+
+        assert!(text.contains("app: gtd-tracker (requested)"));
+        assert!(text.contains("alias_app_ref: app:billing"));
+        assert!(text.contains(
+            "alias_app_mismatch: requested app:gtd-tracker but alias returned app:billing"
+        ));
+        assert_eq!(
+            validate_canary_alias_app(&request, &response),
+            Err(
+                "canary response alias app mismatch: requested app:gtd-tracker, alias returned app:billing"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
