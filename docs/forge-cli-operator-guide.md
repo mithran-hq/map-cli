@@ -79,8 +79,8 @@ Onboarding and Custom CI:
 - `set_repo_variables` writes non-secret repo/app identity GitHub Actions
   Variables for custom CI when a GitHub token is available. It reports failures
   in JSON and does not fail onboarding. Operators still need production values
-  for `MAP_CONTROL_ENDPOINT`, `MAP_AUTH_ENDPOINT`, and `MAP_PLATFORM_ENV`
-  before the custom-CI workflow can run.
+  for `MAP_CONTROL_ENDPOINT` and `MAP_AUTH_ENDPOINT` before the custom-CI
+  workflow can run.
 
 Access, publish, and canary:
 

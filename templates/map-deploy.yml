@@ -50,7 +50,6 @@ jobs:
       # Required production repo Variables (Settings → Secrets and variables → Actions → Variables).
       MAP_CONTROL_ENDPOINT: ${{ vars.MAP_CONTROL_ENDPOINT }}
       MAP_AUTH_ENDPOINT: ${{ vars.MAP_AUTH_ENDPOINT }}
-      MAP_PLATFORM_ENV: ${{ vars.MAP_PLATFORM_ENV }}
       MAP_INSTALLATION_REF: ${{ vars.MAP_INSTALLATION_REF }}
       MAP_APP_REF: ${{ vars.MAP_APP_REF }}
       # Optional override; the default is the public OIDC audience for map-control.
@@ -67,10 +66,9 @@ jobs:
           set -euo pipefail
 
           repo="${GITHUB_REPOSITORY}"                  # owner/repo
-          platform_env="${MAP_PLATFORM_ENV}"
 
           missing=0
-          for name in MAP_CONTROL_ENDPOINT MAP_AUTH_ENDPOINT MAP_PLATFORM_ENV MAP_INSTALLATION_REF MAP_APP_REF; do
+          for name in MAP_CONTROL_ENDPOINT MAP_AUTH_ENDPOINT MAP_INSTALLATION_REF MAP_APP_REF; do
             if [ -z "${!name:-}" ]; then
               echo "::error::${name} production repository variable is required for the opt-in MAP custom-CI deploy workflow. Set it in GitHub Actions Variables. If the repo is not registered yet, first run 'map onboard <owner/repo> --installation-ref <ref> --repo-dir <checkout> --with-ci-workflow'." >&2
               missing=1
@@ -92,7 +90,6 @@ jobs:
               app_env="${INPUT_ENV:-production}"
               ;;
           esac
-          deployment_ref="deployment://${platform_env}/${app_env}/${repo##*/}-${GITHUB_RUN_ID}"
 
           # Exchange the GitHub OIDC token for a short-lived MAP token.
           # `id-token: write` above provides the request credentials.
@@ -130,7 +127,6 @@ jobs:
           fi
 
           body="$(jq -nc \
-            --arg deployment_ref "${deployment_ref}" \
             --arg repository_ref "github://${repo}" \
             --arg requested_ref "${requested_ref}" \
             --arg source_sha "${source_sha}" \
@@ -139,14 +135,12 @@ jobs:
             --arg app_env "${app_env}" \
             --arg tenant_ref "${MAP_TENANT_REF}" \
             --arg account_ref "${MAP_ACCOUNT_REF}" \
-            --arg platform_env "${platform_env}" \
-            '{deployment_ref:$deployment_ref, repository_ref:$repository_ref,
-              requested_ref:$requested_ref, installation_ref:$installation_ref,
+            '{repository_ref:$repository_ref, requested_ref:$requested_ref, installation_ref:$installation_ref,
               app_ref:$app_ref, app_env:$app_env, tenant_ref:$tenant_ref,
-              account_ref:$account_ref, platform_env:$platform_env}
+              account_ref:$account_ref}
              | if $source_sha != "" then . + {source_sha:$source_sha} else . end')"
 
-          echo "Dispatching deploy: ${deployment_ref} (env=${app_env} ref=${requested_ref})"
+          echo "Dispatching deploy: env=${app_env} ref=${requested_ref}"
 
           http_code="$(curl -sS --max-time 600 -o response.json -w '%{http_code}' \
             -X POST "${MAP_CONTROL_ENDPOINT%/}/v1/map-control/deploy/request" \

@@ -198,8 +198,8 @@ struct DeployRequestArgs {
     #[arg(long)]
     account_ref: Option<String>,
 
-    /// MAP platform environment identifier for this request. Use the value provided by Mithran.
-    #[arg(long)]
+    /// Compatibility override for pre-derived MAP platform environment requests.
+    #[arg(long, hide = true)]
     platform_env: Option<String>,
 
     /// Explicit deployment ref; the control-plane mints one when omitted.
@@ -813,20 +813,29 @@ fn deploy_request(cli: &Cli, args: &DeployRequestArgs) -> Result<(), String> {
     post(
         cli,
         "/v1/map-control/deploy/request",
-        json!({
-            "deployment_ref": args.deployment_ref,
-            "repository_ref": repository_ref,
-            "installation_ref": args.installation_ref,
-            "app_ref": args.app_ref,
-            "app_env": args.target.env,
-            "tenant_ref": args.tenant_ref,
-            "account_ref": args.account_ref,
-            "platform_env": args.platform_env,
-            "requested_ref": args.target.ref_name,
-            "source_sha": args.target.sha,
-            "authority_evidence_ref": args.evidence_ref,
-        }),
+        deploy_request_body(args, repository_ref),
     )
+}
+
+fn deploy_request_body(args: &DeployRequestArgs, repository_ref: String) -> Value {
+    let mut body = json!({
+        "repository_ref": repository_ref,
+        "installation_ref": args.installation_ref,
+        "app_ref": args.app_ref,
+        "app_env": args.target.env,
+        "tenant_ref": args.tenant_ref,
+        "account_ref": args.account_ref,
+        "requested_ref": args.target.ref_name,
+        "source_sha": args.target.sha,
+        "authority_evidence_ref": args.evidence_ref,
+    });
+    if let Some(deployment_ref) = &args.deployment_ref {
+        body["deployment_ref"] = json!(deployment_ref);
+    }
+    if let Some(platform_env) = &args.platform_env {
+        body["platform_env"] = json!(platform_env);
+    }
+    body
 }
 
 /// Resolve a GitHub token from (in order): the flag, $GITHUB_TOKEN, $GH_TOKEN, `gh auth token`.
@@ -2426,6 +2435,37 @@ mod tests {
                     Some("github-installation://131136661")
                 );
                 assert_eq!(args.app_ref.as_deref(), Some("app:demo"));
+                let body = deploy_request_body(&args, "github://mithran-hq/demo".to_string());
+                assert!(body.get("platform_env").is_none());
+                assert!(body.get("deployment_ref").is_none());
+            }
+            _ => panic!("expected deploy"),
+        }
+    }
+
+    #[test]
+    fn deploy_preserves_hidden_platform_env_override_for_compatibility() {
+        let cli = Cli::try_parse_from([
+            "map",
+            "deploy",
+            "--repo",
+            "mithran-hq/demo",
+            "--sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--platform-env",
+            "sandbox",
+            "--deployment-ref",
+            "deployment://sandbox/preview/manual",
+        ])
+        .expect("hidden compatibility flag still parses");
+        match cli.command {
+            Command::Deploy(args) => {
+                let body = deploy_request_body(&args, "github://mithran-hq/demo".to_string());
+                assert_eq!(body["platform_env"], json!("sandbox"));
+                assert_eq!(
+                    body["deployment_ref"],
+                    json!("deployment://sandbox/preview/manual")
+                );
             }
             _ => panic!("expected deploy"),
         }
@@ -2467,6 +2507,7 @@ mod tests {
             "BYO-CI",
             "Compatibility",
             "compatibility",
+            "platform-env",
             "webhook-native",
             "Aegis.app",
             "sandbox",
@@ -2929,7 +2970,6 @@ mod tests {
         for required in [
             "MAP_CONTROL_ENDPOINT",
             "MAP_AUTH_ENDPOINT",
-            "MAP_PLATFORM_ENV",
             "MAP_INSTALLATION_REF",
             "MAP_APP_REF",
         ] {
@@ -2939,12 +2979,15 @@ mod tests {
             );
         }
         assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains(
-            "for name in MAP_CONTROL_ENDPOINT MAP_AUTH_ENDPOINT MAP_PLATFORM_ENV MAP_INSTALLATION_REF MAP_APP_REF"
+            "for name in MAP_CONTROL_ENDPOINT MAP_AUTH_ENDPOINT MAP_INSTALLATION_REF MAP_APP_REF"
         ));
         assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("production repository variable is required"));
         assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains(
             "map onboard <owner/repo> --installation-ref <ref> --repo-dir <checkout> --with-ci-workflow"
         ));
+        assert!(!MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("MAP_PLATFORM_ENV"));
+        assert!(!MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("platform_env"));
+        assert!(!MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("deployment_ref"));
         assert!(!MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("manual `map deploy`"));
         for forbidden in [
             "ADR-",
