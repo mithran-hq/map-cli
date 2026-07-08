@@ -1,23 +1,24 @@
-# map-deploy.yml — thin MAP deploy trigger.
+# map-deploy.yml — opt-in MAP custom-CI deploy trigger.
 #
 # Deploys fire from THREE triggers only — NO deploy-on-every-push:
 #   • push/merge to a release branch (release/**) → production deploy of that SHA
 #   • a release tag (vX.Y.Z, semver)              → production deploy of that SHA
-#   • manual `map deploy <HEAD|SHA>`              → workflow_dispatch
+#   • manual GitHub Actions workflow_dispatch     → selected app env + ref
 # GitHub Actions is the trigger + audit/status surface ONLY. No LLM / build / heavy
 # work runs here — the deploy-review gate stays server-side in mithran-control-plane.
 # This workflow POSTs the deploy request to the control-plane chokepoint
 # `/v1/map-control/deploy/request`; the state machine reviews-before-build as usual.
 #
-# `map onboard <owner/repo> --repo-dir <checkout>` drops this file into a repo at
-# `.github/workflows/map-deploy.yml`. Keep it in sync with map-cli/templates/map-deploy.yml.
+# `map onboard <owner/repo> --repo-dir <checkout> --with-ci-workflow` drops this file
+# into a repo at `.github/workflows/map-deploy.yml`. Keep it in sync with
+# map-cli/templates/map-deploy.yml.
 #
 # AUTH (ADR-0023, keyless): the workflow authenticates to the PUBLIC control-plane edge
 # via GitHub OIDC federation — NO stored deploy secret. It requests a GitHub Actions OIDC
 # token (audience = map-control) and exchanges it at mithran-auth for a short-lived
 # map-control token, which the Envoy edge ext_authz validates. mithran-auth mints only for
 # a repo with an ACTIVE onboarding binding (so `map onboard` must have run). Runs on a
-# GitHub-hosted runner against the public edge — no co-located runner / localhost needed.
+# GitHub-hosted runner against the public authenticated edge.
 
 name: map-deploy
 
@@ -33,7 +34,7 @@ on:
   workflow_dispatch:
     inputs:
       env:
-        description: "Platform-internal target env (sandbox | staging | production). Operators deploy to production."
+        description: "App environment to deploy (preview | production)."
         required: false
         default: production
         type: string
@@ -53,14 +54,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      # Public edge endpoints (Settings → Variables; defaults target the sandbox edge).
-      MAP_CONTROL_ENDPOINT: ${{ vars.MAP_CONTROL_ENDPOINT || 'https://control-plane.sandbox.mithran.cloud' }}
-      MAP_AUTH_ENDPOINT: ${{ vars.MAP_AUTH_ENDPOINT || 'https://auth.sandbox.mithran.cloud' }}
-      MAP_OIDC_AUDIENCE: ${{ vars.MAP_OIDC_AUDIENCE || 'map-control' }}
-      MAP_PLATFORM_ENV: ${{ vars.MAP_PLATFORM_ENV || 'sandbox' }}
-      # Per-repo routing config (set by `map onboard`). No secrets — auth is via OIDC.
+      # Required production repo Variables (Settings → Secrets and variables → Actions → Variables).
+      MAP_CONTROL_ENDPOINT: ${{ vars.MAP_CONTROL_ENDPOINT }}
+      MAP_AUTH_ENDPOINT: ${{ vars.MAP_AUTH_ENDPOINT }}
+      MAP_PLATFORM_ENV: ${{ vars.MAP_PLATFORM_ENV }}
       MAP_INSTALLATION_REF: ${{ vars.MAP_INSTALLATION_REF }}
       MAP_APP_REF: ${{ vars.MAP_APP_REF }}
+      # Optional override; the default is the public OIDC audience for map-control.
+      MAP_OIDC_AUDIENCE: ${{ vars.MAP_OIDC_AUDIENCE || 'map-control' }}
+      # Optional per-repo routing config. No secrets — auth is via OIDC.
       MAP_TENANT_REF: ${{ vars.MAP_TENANT_REF }}
       MAP_ACCOUNT_REF: ${{ vars.MAP_ACCOUNT_REF }}
       INPUT_ENV: ${{ inputs.env }}
@@ -73,6 +75,18 @@ jobs:
 
           repo="${GITHUB_REPOSITORY}"                  # owner/repo
           platform_env="${MAP_PLATFORM_ENV}"
+
+          missing=0
+          for name in MAP_CONTROL_ENDPOINT MAP_AUTH_ENDPOINT MAP_PLATFORM_ENV MAP_INSTALLATION_REF MAP_APP_REF; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::${name} production repository variable is required for the opt-in MAP custom-CI deploy workflow. Set it in GitHub Actions Variables after running 'map onboard --with-ci-workflow'." >&2
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            exit 1
+          fi
+
           # Trigger-aware. A release-branch / tag PUSH deploys the pushed SHA to
           # production; manual dispatch uses the operator's env + ref. Nothing else
           # reaches this workflow (see the `on:` filter) — no deploy-on-every-push.
@@ -87,11 +101,6 @@ jobs:
               ;;
           esac
           deployment_ref="deployment://${platform_env}/${app_env}/${repo##*/}-${GITHUB_RUN_ID}"
-
-          if [ -z "${MAP_INSTALLATION_REF}" ]; then
-            echo "::error::MAP_INSTALLATION_REF variable is required (deploy/request rejects a missing installation_ref). Set it via 'map onboard' or repo Variables." >&2
-            exit 1
-          fi
 
           # ADR-0023 keyless auth: GitHub OIDC token (aud=map-control) → mithran-auth exchange
           # → short-lived map-control token. id-token:write (above) provides the request creds.

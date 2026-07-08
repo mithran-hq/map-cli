@@ -19,6 +19,7 @@ const MAP_DEPLOY_WORKFLOW_TEMPLATE: &str = include_str!("../templates/map-deploy
 
 const USER_AGENT: &str = concat!("map-cli/", env!("CARGO_PKG_VERSION"));
 const CANARY_DEPLOY_PATH: &str = "/v1/map-control/deploy/canary";
+const LIVE_ADAPTER_MODE: &str = "sandbox-live";
 
 #[derive(Parser)]
 #[command(name = "map", version, about = "Thin MAP client for Aegis.app")]
@@ -53,9 +54,9 @@ enum Command {
     #[command(alias = "deploy-request")]
     Deploy(DeployRequestArgs),
     /// Onboard a repo: one authenticated control-plane `/onboard` call (records the source
-    /// registry binding — P2a/P2b) + a local scaffold of the deploy workflow + manifest.
+    /// registry binding — P2a/P2b) + local manifest scaffold; custom CI is opt-in.
     Onboard(OnboardArgs),
-    /// DEPRECATED: use `map onboard`. Local workflow scaffold only (no host steps, no API call).
+    /// DEPRECATED: use `map onboard`. Compatibility scaffold shim only.
     Setup(SetupArgs),
     /// ADR-0019 (app access & sharing): declare who can reach a protected app as code in
     /// `access.yaml`, then reconcile it into the control-plane. `apply` takes effect hot
@@ -169,7 +170,7 @@ struct DeployRequestArgs {
     #[arg(long)]
     account_ref: Option<String>,
 
-    /// Platform env, e.g. `sandbox`.
+    /// Platform env, e.g. `production`.
     #[arg(long)]
     platform_env: Option<String>,
 
@@ -189,7 +190,7 @@ struct DoctorArgs {
     app: Option<String>,
 }
 
-/// `map setup <owner/repo>` (DEPRECATED — use `map onboard`): legacy scaffold-only shim.
+/// Deprecated setup command: use `map onboard`.
 #[derive(Args)]
 struct SetupArgs {
     /// Repository to onboard, `owner/repo`.
@@ -212,7 +213,7 @@ struct SetupArgs {
 /// control-plane `/onboard` endpoint (records the source-registry binding — P2a/P2b) plus a
 /// local `mithran.yaml` scaffold. Webhook-native by default (no repo workflow — the App
 /// installation is the deploy trigger); `--with-ci-workflow` opts into the BYO-CI OIDC deploy
-/// workflow (ADR-0023). Replaces `map setup`'s host-step printing.
+/// workflow (ADR-0023). Replaces the legacy setup command's host-step printing.
 #[derive(Args)]
 struct OnboardArgs {
     /// Repository to onboard, `owner/repo`.
@@ -826,12 +827,12 @@ fn validate_repo_slug(repo: &str) -> Result<(), String> {
 
 /// `map onboard <owner/repo>` (P3a). One authenticated call to the control-plane `/onboard`
 /// endpoint records the source-registry binding (P2a/P2b) — so the repo passes the source
-/// broker allowlist with no restart — then scaffolds the deploy workflow + a starter manifest
-/// into `--repo-dir`. Supersedes `map setup`'s host-step printing.
+/// broker allowlist with no restart — then scaffolds a starter manifest into `--repo-dir`.
+/// With `--with-ci-workflow`, it also scaffolds the opt-in custom-CI workflow. Supersedes the
+/// legacy setup command's host-step printing.
 ///
-/// Scope: registry binding + scaffold. Setting repo Variables (`MAP_*`) + the `MAP_CONTROL_TOKEN`
-/// secret via the GitHub API is a focused follow-up (map-cli#11). Auto-resolving the installation
-/// from the caller's identity + App grant is P3b (mithran-control-plane#79).
+/// Scope: registry binding + scaffold. Auto-resolving the installation from the caller's
+/// identity + App grant is P3b (mithran-control-plane#79).
 fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
     validate_repo_slug(&args.repo)?;
     let (_owner, repo_name) = args.repo.split_once('/').expect("validated owner/repo");
@@ -882,8 +883,8 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
 
     // Webhook-native default (ADR-0016 amendment): the App installation + webhook is the deploy
     // trigger, so onboard writes NO repo workflow and touches no repo Actions config — zero repo
-    // footprint. `--with-ci-workflow` opts into the BYO-CI keyless-OIDC path (ADR-0023): scaffold
-    // map-deploy.yml + set the non-secret `MAP_*` repo Variables the workflow reads.
+    // footprint. `--with-ci-workflow` opts into the custom-CI keyless-OIDC path (ADR-0023):
+    // scaffold map-deploy.yml + best-effort set non-secret routing repo Variables.
     let (workflow_path, variables_outcome) = if args.with_ci_workflow {
         let workflow_path = scaffold_deploy_workflow(args.repo_dir.as_ref(), &args.workflow)?;
         let variables = onboard_variables(args, &project_ref);
@@ -1051,8 +1052,8 @@ fn format_str_list(value: &Value) -> String {
     }
 }
 
-/// The non-secret repo Variables the OIDC `map-deploy.yml` reads. Optional refs are set only
-/// when present (the cp may also derive tenant/account from the edge identity — cp#86).
+/// The non-secret routing repo Variables for the OIDC `map-deploy.yml`. Optional refs are set
+/// only when present (the cp may also derive tenant/account from the edge identity — cp#86).
 fn onboard_variables(args: &OnboardArgs, project_ref: &str) -> Vec<(&'static str, String)> {
     let mut vars = vec![
         ("MAP_INSTALLATION_REF", args.installation_ref.clone()),
@@ -1169,13 +1170,13 @@ fn scaffold_manifest(repo_dir: Option<&PathBuf>, name: &str) -> Result<Option<Pa
     Ok(Some(path))
 }
 
-/// DEPRECATED (`map setup`): use `map onboard`. Kept as a local scaffold-only shim — it writes
+/// DEPRECATED setup command: use `map onboard`. Kept as a local scaffold-only shim — it writes
 /// the deploy workflow but does NOT call the control-plane (it cannot supply the installation
 /// ref) and no longer prints the host onboarding wall (superseded by the `/onboard` endpoint).
 fn setup(cli: &Cli, args: &SetupArgs) -> Result<(), String> {
     validate_repo_slug(&args.repo)?;
     eprintln!(
-        "map: `map setup` is deprecated; use `map onboard <owner/repo> --installation-ref <ref>`."
+        "map: the setup command is deprecated; use `map onboard <owner/repo> --installation-ref <ref>`."
     );
     // Webhook-native default: scaffold nothing unless the BYO-CI opt-in is requested.
     let workflow_path = if args.with_ci_workflow {
@@ -1848,11 +1849,11 @@ fn doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), String> {
 
 fn adapter_check(config: &Value) -> Check {
     match config.get("adapter_mode").and_then(Value::as_str) {
-        Some("sandbox-live") => Check::ok("adapter mode", "sandbox-live"),
+        Some(LIVE_ADAPTER_MODE) => Check::ok("adapter mode", "live"),
         Some(other) => Check::warn(
             "adapter mode",
-            format!("adapter_mode={other} (not sandbox-live)"),
-            "set the control-plane adapter to sandbox-live for live deploys",
+            format!("adapter_mode={other} (expected live adapter)"),
+            "set the control-plane adapter to live deploy mode",
         ),
         None => Check::warn(
             "adapter mode",
@@ -2135,7 +2136,7 @@ mod tests {
             "--repo",
             "mithran-hq/demo",
             "--env",
-            "staging",
+            "production",
             "--ref",
             "refs/heads/release/1.2",
             "--installation-ref",
@@ -2147,7 +2148,7 @@ mod tests {
         match cli.command {
             Command::Deploy(args) => {
                 assert_eq!(args.target.repo, "mithran-hq/demo");
-                assert_eq!(args.target.env.as_deref(), Some("staging"));
+                assert_eq!(args.target.env.as_deref(), Some("production"));
                 assert_eq!(
                     args.target.ref_name.as_deref(),
                     Some("refs/heads/release/1.2")
@@ -2348,10 +2349,38 @@ mod tests {
         // ADR-0023: keyless auth via GitHub OIDC federation (no static deploy secret).
         assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("id-token: write"));
         assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("/v1/auth/github-oidc/exchange"));
-        // Runs on a GitHub-hosted runner against the public edge — no self-hosted/localhost.
+        // Runs on a GitHub-hosted runner against the public authenticated edge.
         assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("runs-on: ubuntu-latest"));
-        assert!(!MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("self-hosted"));
         assert!(!MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("MAP_CONTROL_TOKEN"));
+        for required in [
+            "MAP_CONTROL_ENDPOINT",
+            "MAP_AUTH_ENDPOINT",
+            "MAP_PLATFORM_ENV",
+            "MAP_INSTALLATION_REF",
+            "MAP_APP_REF",
+        ] {
+            assert!(
+                MAP_DEPLOY_WORKFLOW_TEMPLATE.contains(&format!("${{{{ vars.{required} }}}}")),
+                "template should read {required} from repo Variables"
+            );
+        }
+        assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains(
+            "for name in MAP_CONTROL_ENDPOINT MAP_AUTH_ENDPOINT MAP_PLATFORM_ENV MAP_INSTALLATION_REF MAP_APP_REF"
+        ));
+        assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("production repository variable is required"));
+        for forbidden in [
+            "map setup",
+            "sandbox",
+            "staging",
+            "127.0.0.1",
+            "localhost",
+            "INGRESS GAP",
+        ] {
+            assert!(
+                !MAP_DEPLOY_WORKFLOW_TEMPLATE.contains(forbidden),
+                "template should not contain customer-facing stale term {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -2361,16 +2390,16 @@ mod tests {
         let fail = format_check(&Check::fail(
             "source allowlist",
             "0 repositories",
-            "run setup",
+            "run `map onboard <owner/repo> --installation-ref <ref>`",
         ));
         assert!(fail.starts_with("[fail] source allowlist — 0 repositories"));
-        assert!(fail.contains("↳ run setup"));
+        assert!(fail.contains("↳ run `map onboard <owner/repo> --installation-ref <ref>`"));
     }
 
     #[test]
-    fn adapter_check_classifies_sandbox_live() {
+    fn adapter_check_classifies_live_mode() {
         assert_eq!(
-            adapter_check(&json!({ "adapter_mode": "sandbox-live" })).level,
+            adapter_check(&json!({ "adapter_mode": LIVE_ADAPTER_MODE })).level,
             Level::Ok
         );
         assert_eq!(
