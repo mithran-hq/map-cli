@@ -2044,7 +2044,7 @@ fn app_allowlist_check(allowlist_count: Option<u64>, has_deployment: bool, app: 
         _ => Check::warn(
             "app source access",
             format!("cannot confirm source access for {app} (the config endpoint exposes only a count, not the registered repo list)"),
-            format!("run `map onboard {app} --installation-ref <ref>`; doctor counts registry bindings (P2a) so an onboarded repo shows here"),
+            format!("run `map onboard {app} --installation-ref <ref>` to record repo source access, then rerun doctor"),
         ),
     }
 }
@@ -2864,6 +2864,17 @@ mod tests {
             unconfirmed.detail,
             "cannot confirm source access for mithran-hq/demo (the config endpoint exposes only a count, not the registered repo list)"
         );
+        assert_eq!(
+            unconfirmed.remediation,
+            Some(
+                "run `map onboard mithran-hq/demo --installation-ref <ref>` to record repo source access, then rerun doctor"
+                    .to_string()
+            )
+        );
+        let unconfirmed_text = format_check(&unconfirmed);
+        assert!(!unconfirmed_text.contains("registry"));
+        assert!(!unconfirmed_text.contains("binding"));
+        assert!(!unconfirmed_text.contains("P2a"));
         assert_eq!(
             app_route_check(true, true, "mithran-hq/demo").level,
             Level::Ok
