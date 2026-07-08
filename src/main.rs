@@ -22,24 +22,28 @@ const CANARY_DEPLOY_PATH: &str = "/v1/map-control/deploy/canary";
 const LIVE_ADAPTER_MODE: &str = "sandbox-live";
 const DEFAULT_STARTER_RUNTIME: &str = "nodejs22";
 const DEFAULT_STARTER_COMMAND: &str = "npm start";
+const AUTH_FLAGS_HELP: &str =
+    "Authentication flags: --login-state <path>, --endpoint <url>, --token <token>";
+const LOGIN_STATE_FLAG_HELP: &str = "State path flag: --login-state <path>";
 
 #[derive(Parser)]
 #[command(
     name = "map",
     version,
-    about = "Deploy, inspect, publish, and manage Forge apps"
+    about = "Deploy, inspect, publish, and manage Forge apps",
+    after_help = AUTH_FLAGS_HELP
 )]
 struct Cli {
     /// Path to a saved map login state file.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     login_state: Option<PathBuf>,
 
     /// Override the Forge control-plane endpoint for this command.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     endpoint: Option<String>,
 
     /// Bearer token for this command. Prefer saved login state for interactive use.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     token: Option<String>,
 
     /// Print structured JSON when the command supports it.
@@ -53,40 +57,52 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Save or print local Forge login state.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Login(LoginCommand),
     /// Show the saved Forge account and endpoint.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Whoami,
     /// Check control-plane readiness and optional app diagnostics.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Doctor(DoctorArgs),
     /// Write a starter mithran.yaml manifest.
     Init(InitArgs),
     /// Validate a deploy request without deploying.
     Validate(DeployTarget),
     /// Request a deploy directly. Built-in GitHub App webhooks are preferred for standard refs.
-    #[command(alias = "deploy-request")]
+    #[command(alias = "deploy-request", after_help = AUTH_FLAGS_HELP)]
     Deploy(DeployRequestArgs),
     /// Register a GitHub repo with Forge and optionally scaffold local files.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Onboard(OnboardArgs),
     /// Show onboarding guidance.
     #[command(hide = true)]
     Setup(SetupArgs),
     /// Plan or apply protected app sharing from access.yaml.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Access(AccessArgs),
     /// List internal versions, app-environment aliases, and the published clean URL.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Versions(VersionsArgs),
     /// Publish a reviewed version to the app's clean public URL.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Publish(PublishArgs),
     /// Start, promote, or roll back a weighted canary.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Canary(CanaryArgs),
     /// Show deploy status for a deployment ref.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Status(IdArgs),
     /// Poll deploy status until success, failure, or timeout.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Watch(WatchArgs),
     /// Explain where to inspect deploy status and evidence.
     Logs(IdArgs),
     /// Show deploy evidence for a deployment ref.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Evidence(IdArgs),
     /// Roll back the route pointer for a deployment ref.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Rollback(RollbackArgs),
     /// Print the map CLI version.
     Version,
@@ -101,8 +117,10 @@ struct LoginCommand {
 #[derive(Subcommand)]
 enum LoginSubcommand {
     /// Save control-plane endpoint and token metadata locally.
+    #[command(after_help = LOGIN_STATE_FLAG_HELP)]
     Save(LoginSaveArgs),
     /// Print the saved token for an allowed audience.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     PrintToken(PrintTokenArgs),
 }
 
@@ -284,6 +302,7 @@ struct AccessArgs {
 #[derive(Subcommand)]
 enum AccessSubcommand {
     /// Apply the resolved access policy to Forge.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Apply(AccessApplyArgs),
     /// Print the resolved access policy without applying it (no control-plane call).
     Plan(AccessApplyArgs),
@@ -358,10 +377,13 @@ struct CanaryArgs {
 #[derive(Subcommand)]
 enum CanarySubcommand {
     /// Shift a 1..99% traffic slice to a succeeded deployment.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Start(CanaryStartArgs),
     /// Promote the active canary to 100% and clear the split.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Promote(CanaryEndArgs),
     /// Drop the active canary split and keep the current deployment at 100%.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Rollback(CanaryEndArgs),
 }
 
@@ -2483,6 +2505,99 @@ mod tests {
     }
 
     #[test]
+    fn local_only_help_hides_auth_globals_but_keeps_json_when_used() {
+        for path in [
+            &["init"][..],
+            &["validate"][..],
+            &["version"][..],
+            &["access", "plan"][..],
+        ] {
+            let mut command = Cli::command();
+            let help = render_help_for_path(&mut command, path);
+            let label = path.join(" ");
+
+            for flag in ["--login-state", "--endpoint", "--token"] {
+                assert!(
+                    !help.contains(flag),
+                    "{label} help should not show auth flag {flag}:\n{help}"
+                );
+            }
+            assert!(
+                help.contains("--json"),
+                "{label} help should keep --json because it affects output:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_help_documents_auth_globals() {
+        for path in [
+            &["login"][..],
+            &["login", "print-token"][..],
+            &["whoami"][..],
+            &["doctor"][..],
+            &["deploy"][..],
+            &["onboard"][..],
+            &["access"][..],
+            &["access", "apply"][..],
+            &["versions"][..],
+            &["publish"][..],
+            &["canary"][..],
+            &["canary", "start"][..],
+            &["canary", "promote"][..],
+            &["canary", "rollback"][..],
+            &["status"][..],
+            &["watch"][..],
+            &["evidence"][..],
+            &["rollback"][..],
+        ] {
+            let mut command = Cli::command();
+            let help = render_help_for_path(&mut command, path);
+            let label = path.join(" ");
+            assert!(
+                help.contains(AUTH_FLAGS_HELP),
+                "{label} help should document auth globals:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_save_help_documents_state_path_without_endpoint_or_token_noise() {
+        let mut command = Cli::command();
+        let help = render_help_for_path(&mut command, &["login", "save"]);
+
+        assert!(
+            help.contains(LOGIN_STATE_FLAG_HELP),
+            "login save should document where the state file is written:\n{help}"
+        );
+        assert!(
+            !help.contains("--endpoint"),
+            "login save should not show command auth endpoint override:\n{help}"
+        );
+        assert!(
+            !help.contains("--token"),
+            "login save should not show command auth token override:\n{help}"
+        );
+    }
+
+    #[test]
+    fn authenticated_global_flags_still_parse_before_subcommand() {
+        let cli = Cli::try_parse_from([
+            "map",
+            "--endpoint",
+            "https://map.example",
+            "--token",
+            "test-token",
+            "doctor",
+        ])
+        .expect("global auth flags before subcommand still parse");
+
+        assert_eq!(cli.endpoint.as_deref(), Some("https://map.example"));
+        assert_eq!(cli.token.as_deref(), Some("test-token"));
+        assert!(matches!(cli.command, Command::Doctor(_)));
+    }
+
+    #[test]
     fn public_help_does_not_leak_internal_planning_terms() {
         let forbidden = [
             "ADR-",
@@ -2545,6 +2660,7 @@ mod tests {
     }
 
     fn render_help_for_path(command: &mut clap::Command, path: &[&str]) -> String {
+        command.build();
         let mut current = command;
         for segment in path {
             current = current
