@@ -1243,7 +1243,8 @@ fn map_versions(cli: &Cli, args: &VersionsArgs) -> Result<(), String> {
 /// Pure shape of `map versions`: filter `routes/status` `aliases` to this app and split into
 /// `versions` / `aliases` / `published`. Field names mirror the control-plane `RoutePointerRecord`
 /// (`app_ref`, `route_pointer_ref`, `current_deployment_ref`, `hostname`, `app_env`, `pinned`,
-/// `updated_from_action`). `published` is `null` when the app has never been published.
+/// `updated_from_action`, and active canary split fields when present). `published` is `null` when
+/// the app has never been published.
 fn versions_payload(routes: &Value, app_ref: &str) -> Value {
     let mut versions: Vec<Value> = Vec::new();
     let mut aliases: Vec<Value> = Vec::new();
@@ -1283,14 +1284,21 @@ fn versions_payload(routes: &Value, app_ref: &str) -> Value {
                     "route_pointer_ref": pointer_ref,
                 }));
             } else {
-                aliases.push(json!({
+                let mut alias = json!({
                     "app_env": pointer.get("app_env"),
                     "updated_from_action": pointer.get("updated_from_action"),
                     "deployment_ref": deployment_ref,
                     "hostname": hostname,
                     "pinned": pointer.get("pinned").and_then(Value::as_bool).unwrap_or(false),
                     "route_pointer_ref": pointer_ref,
-                }));
+                });
+                if let Some(canary_deployment_ref) = pointer.get("canary_deployment_ref") {
+                    alias["canary_deployment_ref"] = canary_deployment_ref.clone();
+                }
+                if let Some(canary_weight_pct) = pointer.get("canary_weight_pct") {
+                    alias["canary_weight_pct"] = canary_weight_pct.clone();
+                }
+                aliases.push(alias);
             }
         }
     }
@@ -1348,13 +1356,26 @@ fn render_versions_text(payload: &Value) -> String {
                 } else {
                     ""
                 };
+                let canary = match (
+                    alias
+                        .get("canary_deployment_ref")
+                        .and_then(Value::as_str)
+                        .filter(|deployment_ref| !deployment_ref.is_empty()),
+                    alias.get("canary_weight_pct").and_then(Value::as_u64),
+                ) {
+                    (Some(deployment_ref), Some(weight_pct)) => {
+                        format!("  [canary {deployment_ref} {weight_pct}%]")
+                    }
+                    _ => String::new(),
+                };
                 out.push_str(&format!(
-                    "  {} ({}){}  ->  {}  {}\n",
+                    "  {} ({}){}  ->  {}  {}{}\n",
                     alias["app_env"].as_str().unwrap_or_default(),
                     alias["updated_from_action"].as_str().unwrap_or_default(),
                     pinned,
                     alias["deployment_ref"].as_str().unwrap_or_default(),
                     alias["hostname"].as_str().unwrap_or_default(),
+                    canary,
                 ));
             }
         }
@@ -2531,6 +2552,8 @@ mod tests {
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[0]["app_env"], "production");
         assert_eq!(aliases[0]["updated_from_action"], "ProductionPromote");
+        assert!(aliases[0].get("canary_deployment_ref").is_none());
+        assert!(aliases[0].get("canary_weight_pct").is_none());
 
         // The published-external pointer surfaces the env-bare hostname + the published version.
         assert_eq!(
@@ -2546,6 +2569,39 @@ mod tests {
         let rendered = render_versions_text(&payload);
         assert!(!rendered.contains("other-app"), "must filter other apps");
         assert!(rendered.contains("https://gtd-tracker.apps.mithran.cloud"));
+        assert!(rendered.contains(
+            "production (ProductionPromote)  ->  deployment://sandbox/production/gtd-2  gtd-tracker-production.sandbox.apps.mithran.cloud\n"
+        ));
+        assert!(!rendered.contains("[canary"));
+    }
+
+    #[test]
+    fn versions_payload_and_text_surface_active_canary_alias() {
+        let mut routes = sample_routes_status();
+        let production = routes["aliases"]["route-pointer://sandbox/production/app:gtd-tracker"]
+            .as_object_mut()
+            .expect("production alias object");
+        production.insert("updated_from_action".to_string(), json!("CanaryWeight"));
+        production.insert(
+            "canary_deployment_ref".to_string(),
+            json!("deployment://sandbox/production/gtd-3"),
+        );
+        production.insert("canary_weight_pct".to_string(), json!(20));
+
+        let payload = versions_payload(&routes, "app:gtd-tracker");
+        let aliases = payload["aliases"].as_array().expect("aliases array");
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0]["updated_from_action"], "CanaryWeight");
+        assert_eq!(
+            aliases[0]["canary_deployment_ref"],
+            "deployment://sandbox/production/gtd-3"
+        );
+        assert_eq!(aliases[0]["canary_weight_pct"], 20);
+
+        let rendered = render_versions_text(&payload);
+        assert!(rendered.contains(
+            "production (CanaryWeight)  ->  deployment://sandbox/production/gtd-2  gtd-tracker-production.sandbox.apps.mithran.cloud  [canary deployment://sandbox/production/gtd-3 20%]\n"
+        ));
     }
 
     #[test]

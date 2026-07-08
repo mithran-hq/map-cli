@@ -97,7 +97,8 @@ Access, publish, and canary:
 - `access apply` POSTs `/v1/map-control/access`.
 - `versions` GETs `/v1/map-control/routes/status`, filters pointers for the
   requested app, and separates addressable internal versions, aliases, and the
-  published external pointer.
+  published external pointer. Active canary aliases include the canary
+  deployment ref and weight in both text and JSON output.
 - `publish` resolves `--version` through `routes/status` or accepts
   `--deployment-ref`, then POSTs `/v1/map-control/deploy/publish` with optional
   `--expected-sha` and `--actor`.

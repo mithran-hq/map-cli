@@ -75,7 +75,8 @@ without changing what end-users see.
 - `map versions <app>` reads `/v1/map-control/routes/status` and lists the app's addressable
   internal versions (label → `deployment_ref` → per-version hostname), its aliases
   (production/preview/release), and which internal version is currently published (or
-  `(not published)`). `<app>` is the app name, normalized to `app:<app>`.
+  `(not published)`). When the production alias has an active canary split, alias output also
+  shows the canary deployment ref and weight. `<app>` is the app name, normalized to `app:<app>`.
 - `map publish <app> [--version <label> | --deployment-ref <ref>] [--expected-sha <sha>]
   [--actor <ref>]` POSTs `/v1/map-control/deploy/publish` to pin the public URL to a chosen
   version. `--version` is resolved to a `deployment_ref` via `routes/status`. The
