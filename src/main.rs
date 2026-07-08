@@ -67,7 +67,7 @@ enum Command {
     Deploy(DeployRequestArgs),
     /// Register a GitHub repo with Forge and optionally scaffold local files.
     Onboard(OnboardArgs),
-    /// Compatibility command: use `map onboard`.
+    /// Show onboarding guidance.
     #[command(hide = true)]
     Setup(SetupArgs),
     /// Plan or apply protected app sharing from access.yaml.
@@ -198,7 +198,7 @@ struct DeployRequestArgs {
     #[arg(long)]
     account_ref: Option<String>,
 
-    /// Control-plane environment value for the request. This is separate from `--env`.
+    /// MAP platform environment identifier for this request. Use the value provided by Mithran.
     #[arg(long)]
     platform_env: Option<String>,
 
@@ -472,8 +472,9 @@ fn run(cli: Cli) -> Result<(), String> {
             let state = resolve_state(&cli)?;
             if !audience_allowed(&state, &args.audience) {
                 return Err(format!(
-                    "login state is not valid for audience `{}`; run `map login`",
-                    args.audience
+                    "login state is not valid for audience `{}`. {}",
+                    args.audience,
+                    login_recovery_hint()
                 ));
             }
             println!("{}", state.access_token);
@@ -574,11 +575,16 @@ fn resolve_state(cli: &Cli) -> Result<LoginState, String> {
     let path = login_state_path(cli.login_state.as_ref())?;
     let text = fs::read_to_string(&path).map_err(|error| {
         format!(
-            "read login state {}: {error}; run `map login`",
-            path.display()
+            "read login state {}: {error}. {}",
+            path.display(),
+            login_recovery_hint()
         )
     })?;
     serde_json::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+fn login_recovery_hint() -> &'static str {
+    "Run `map login save --map-control-endpoint <url> --access-token <token>` to save login state, or pass `--endpoint <url> --token <token>` for one command."
 }
 
 fn login_state_path(override_path: Option<&PathBuf>) -> Result<PathBuf, String> {
@@ -618,7 +624,9 @@ fn audience_allowed(state: &LoginState, audience: &str) -> bool {
 
 fn validate_target(target: &DeployTarget) -> Result<(), String> {
     if target.ref_name.is_none() && target.sha.is_none() {
-        return Err("deploy target requires --ref or --sha".to_string());
+        return Err(
+            "deploy target requires --ref <git-ref> or --sha <40-character-git-sha>".to_string(),
+        );
     }
     if let Some(sha) = &target.sha {
         if sha.len() != 40 || !sha.chars().all(|char| char.is_ascii_hexdigit()) {
@@ -2087,7 +2095,7 @@ fn app_route_check(has_alias: bool, has_deployment: bool, app: &str) -> Check {
         Check::warn(
             "app route/alias",
             format!("no deployment or route alias found for {app}"),
-            format!("after `map onboard {app} --installation-ref <ref>`, deploy with `map deploy --env preview --repo {app}`"),
+            format!("after `map onboard {app} --installation-ref <ref>`, push a matching Git ref through the GitHub App webhook path or run `map deploy --repo {app} --env production --ref <git-ref> --installation-ref <ref> --app-ref app:{name}`"),
         )
     }
 }
@@ -2163,6 +2171,10 @@ mod tests {
         let path = env::temp_dir().join(format!("map-access-{}-{}.yaml", std::process::id(), name));
         fs::write(&path, body).unwrap();
         path
+    }
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!("map-cli-{}-{}", std::process::id(), name))
     }
 
     fn assert_starter_manifest(body: &str, app_id: &str, name: &str, project_ref: &str) {
@@ -2312,7 +2324,11 @@ mod tests {
             ref_name: None,
             sha: None,
         };
-        assert!(validate_target(&target).is_err());
+        let err = validate_target(&target).unwrap_err();
+        assert_eq!(
+            err,
+            "deploy target requires --ref <git-ref> or --sha <40-character-git-sha>"
+        );
     }
 
     #[test]
@@ -2327,6 +2343,57 @@ mod tests {
             principal: None,
         };
         assert!(audience_allowed(&state, "jason-controller"));
+    }
+
+    #[test]
+    fn missing_login_state_points_to_supported_login_paths() {
+        let path = temp_file_path("missing-login");
+        let cli = Cli {
+            login_state: Some(path.clone()),
+            endpoint: None,
+            token: None,
+            json: false,
+            command: Command::Whoami,
+        };
+
+        let err = resolve_state(&cli).unwrap_err();
+
+        assert!(err.contains(&format!("read login state {}", path.display())));
+        assert!(err.contains("map login save --map-control-endpoint <url> --access-token <token>"));
+        assert!(err.contains("--endpoint <url> --token <token>"));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn invalid_login_audience_points_to_supported_login_paths() {
+        let path = temp_file_path("wrong-audience-login");
+        let state = LoginState {
+            map_control_endpoint: "https://map.example".to_string(),
+            jason_controller_endpoint: None,
+            access_token: "secret".to_string(),
+            expires_at: None,
+            audience: Some("map-control".to_string()),
+            scopes: vec![],
+            principal: None,
+        };
+        write_login_state(&path, &state).expect("login state should write");
+
+        let cli = Cli {
+            login_state: Some(path.clone()),
+            endpoint: None,
+            token: None,
+            json: false,
+            command: Command::Login(LoginCommand {
+                command: LoginSubcommand::PrintToken(PrintTokenArgs {
+                    audience: "jason-controller".to_string(),
+                }),
+            }),
+        };
+        let err = run(cli).unwrap_err();
+
+        assert!(err.contains("login state is not valid for audience `jason-controller`"));
+        assert!(err.contains("map login save --map-control-endpoint <url> --access-token <token>"));
+        fs::remove_file(path).ok();
     }
 
     #[test]
@@ -2398,6 +2465,8 @@ mod tests {
             "P3a",
             "P3b",
             "BYO-CI",
+            "Compatibility",
+            "compatibility",
             "webhook-native",
             "Aegis.app",
             "sandbox",
@@ -2414,6 +2483,7 @@ mod tests {
             &["validate"][..],
             &["deploy"][..],
             &["onboard"][..],
+            &["setup"][..],
             &["access"][..],
             &["access", "apply"][..],
             &["access", "plan"][..],
@@ -2872,6 +2942,10 @@ mod tests {
             "for name in MAP_CONTROL_ENDPOINT MAP_AUTH_ENDPOINT MAP_PLATFORM_ENV MAP_INSTALLATION_REF MAP_APP_REF"
         ));
         assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("production repository variable is required"));
+        assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains(
+            "map onboard <owner/repo> --installation-ref <ref> --repo-dir <checkout> --with-ci-workflow"
+        ));
+        assert!(!MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("manual `map deploy`"));
         for forbidden in [
             "ADR-",
             "mithran-control-plane",
@@ -2905,6 +2979,22 @@ mod tests {
         ));
         assert!(fail.starts_with("[fail] source access — 0 repositories"));
         assert!(fail.contains("↳ run `map onboard <owner/repo> --installation-ref <ref>`"));
+    }
+
+    #[test]
+    fn app_route_check_recovery_command_has_required_deploy_inputs() {
+        let check = app_route_check(false, false, "mithran-hq/demo");
+        let remediation = check
+            .remediation
+            .expect("route check should guide recovery");
+
+        assert!(remediation.contains("map onboard mithran-hq/demo --installation-ref <ref>"));
+        assert!(remediation.contains("map deploy --repo mithran-hq/demo"));
+        assert!(remediation.contains("--env production"));
+        assert!(remediation.contains("--ref <git-ref>"));
+        assert!(remediation.contains("--installation-ref <ref>"));
+        assert!(remediation.contains("--app-ref app:demo"));
+        assert!(!remediation.contains("--env preview --repo"));
     }
 
     #[test]

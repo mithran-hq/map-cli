@@ -72,7 +72,7 @@ jobs:
           missing=0
           for name in MAP_CONTROL_ENDPOINT MAP_AUTH_ENDPOINT MAP_PLATFORM_ENV MAP_INSTALLATION_REF MAP_APP_REF; do
             if [ -z "${!name:-}" ]; then
-              echo "::error::${name} production repository variable is required for the opt-in MAP custom-CI deploy workflow. Set it in GitHub Actions Variables after running 'map onboard --with-ci-workflow'." >&2
+              echo "::error::${name} production repository variable is required for the opt-in MAP custom-CI deploy workflow. Set it in GitHub Actions Variables. If the repo is not registered yet, first run 'map onboard <owner/repo> --installation-ref <ref> --repo-dir <checkout> --with-ci-workflow'." >&2
               missing=1
             fi
           done
@@ -87,7 +87,7 @@ jobs:
               requested_ref="${GITHUB_SHA}"
               app_env="production"
               ;;
-            *)  # workflow_dispatch (manual `map deploy`)
+            *)  # workflow_dispatch
               requested_ref="${INPUT_REF:-$GITHUB_SHA}"
               app_env="${INPUT_ENV:-production}"
               ;;

@@ -28,11 +28,12 @@ map onboard mithran-hq/demo --installation-ref github-installation://131136661 \
 # Diagnose readiness against the saved control-plane endpoint.
 map doctor --app mithran-hq/demo
 
-# Trigger a deploy (ADR-0016, webhook-native): direct brokered call to the control-plane.
+# Trigger a direct deploy request. Standard GitHub refs should usually deploy
+# through the GitHub App webhook path after onboarding.
 map deploy --repo mithran-hq/demo --env production --ref refs/heads/release/1.2 \
   --installation-ref github-installation://131136661 --app-ref app:demo
 
-# List an app's addressable internal versions + which one is published (ADR-0018).
+# List an app's addressable internal versions and current published version.
 map versions demo
 
 # Publish a reviewed, succeeded internal version to the app's clean public URL.
@@ -49,14 +50,13 @@ Jason can reuse the MAP login by asking for a controller token:
 map login print-token --audience jason-controller
 ```
 
-## Deploy model (ADR-0016, webhook-native amendment 2026-07-06 — mithran-business#582)
+## Deploy Model
 
-SCM integration is **webhook-native** (the Vercel model). The GitHub App
-installation + webhook is the default deploy trigger: a `git push` to a matching ref is
-HMAC-verified and forwarded to the control-plane
-`/v1/map-control/deploy/request` — **no workflow file lives in the tenant repo**, and there
-is no per-repo deploy secret. The deploy-review gate stays server-side (ADR-0014); GitHub is
-a trigger + audit surface, never the gate.
+The GitHub App installation and webhook are the default deploy trigger. After a
+repository is onboarded, a `git push` to a matching ref is verified and
+forwarded to the control-plane deploy request route. The default path does not
+write a workflow file into the application repository and does not require a
+per-repo deploy secret.
 
 - `map deploy` / `map deploy-request` POST **directly** to the control-plane
   `/v1/map-control/deploy/request` using your saved `map-control` login token (the same call;
@@ -64,13 +64,13 @@ a trigger + audit surface, never the gate.
   authenticated control-plane endpoint. No GitHub Actions workflow is dispatched.
 - `map onboard <owner/repo> --installation-ref <ref>` records the source-registry binding and
   scaffolds a starter `mithran.yaml`. It writes **no** repo workflow by default.
-- **Opt-in custom CI (ADR-0023):** pass `--with-ci-workflow` to `map onboard` to also scaffold
+- **Opt-in custom CI:** pass `--with-ci-workflow` to `map onboard` to also scaffold
   the keyless-OIDC `.github/workflows/map-deploy.yml` (`curl` → OIDC token exchange →
   `/deploy/request`). This is for repos that intentionally trigger deploys from GitHub Actions;
   it is not needed for the default webhook path. The workflow reads required production repo
   Variables and fails clearly if they are absent.
 
-## Publish model (ADR-0018)
+## Publish Model
 
 A deploy makes an internal version *addressable* (its own per-version URL); it does **not**
 move the app's clean, env-bare public URL. That public URL is a separate **published**
@@ -89,7 +89,7 @@ without changing what end-users see.
   deploy) and **stale-safe** (with `--expected-sha`, rejects if the version's recorded source
   SHA moved). On success it prints the published URL.
 
-## Canary model (ADR-0017)
+## Canary Model
 
 Canary operations mutate the app's production alias through the control-plane canary endpoint:
 

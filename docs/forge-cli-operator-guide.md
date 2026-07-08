@@ -1,15 +1,8 @@
 # Forge CLI Operator Guide
 
-This guide maps the Forge-facing MAP CLI surface to the local source,
-commands, control-plane routes, auth requirements, and verification evidence in
+This guide maps the operator-facing MAP CLI surface to commands,
+control-plane routes, auth requirements, and verification evidence in
 `map-cli`.
-
-Central Forge documentation lives in `mithran-business`:
-
-- [Forge documentation hub](https://github.com/mithran-hq/mithran-business/blob/main/docs/forge/README.md)
-- [Forge architecture](https://github.com/mithran-hq/mithran-business/blob/main/docs/forge/architecture.md)
-- [Forge agent/operator guide](https://github.com/mithran-hq/mithran-business/blob/main/docs/forge/agent-operator-guide.md)
-- [Forge documentation plan](https://github.com/mithran-hq/mithran-business/blob/main/docs/forge/documentation-plan.md)
 
 ## Operating Boundary
 
@@ -22,15 +15,15 @@ Central Forge documentation lives in `mithran-business`:
   machine.
 - Calling MAP control-plane deploy, onboard, access, route, publish, evidence,
   rollback, status, and readiness endpoints.
-- Scaffolding `mithran.yaml` and, only when explicitly requested, the BYO-CI
+- Scaffolding `mithran.yaml` and, only when explicitly requested, the custom-CI
   GitHub Actions deploy workflow.
 - Packaging the `map` binary as an Aegis host component artifact.
 
 The repo does not own hosted control-plane behavior, deploy review gates,
 build orchestration, source broker policy, sidecar admission, Auth token
 issuance, runtime-control worker provisioning, route programming, package
-assembly in Aegis.app, or Jason scheduling. Those are server or consumer repo
-concerns. Operators should use this repo to understand the local CLI contract
+assembly in Aegis.app, or Jason scheduling. Those are server or application repo
+concerns. Operators should use this guide to understand the local CLI contract
 and the HTTP calls it makes.
 
 ## Source Map
@@ -75,17 +68,19 @@ Deploy and status flow:
 - `evidence` GETs `/v1/map-control/deploy/evidence`.
 - `rollback` POSTs `/v1/map-control/deploy/rollback`.
 
-Onboarding and BYO-CI:
+Onboarding and Custom CI:
 
 - `onboard` validates `owner/repo`, POSTs `/v1/map-control/onboard`, then
   writes `mithran.yaml` into `--repo-dir` when the file is absent.
-- The webhook-native path is the default. `onboard` writes no workflow unless
+- The GitHub App webhook path is the default. `onboard` writes no workflow unless
   the operator passes `--with-ci-workflow`.
 - `scaffold_deploy_workflow` writes `templates/map-deploy.yml` under
-  `<repo-dir>/.github/workflows/<workflow>` for the explicit BYO-CI path.
-- `set_repo_variables` writes non-secret `MAP_*` GitHub Actions Variables for
-  BYO-CI when a GitHub token is available. It reports failures in JSON and does
-  not fail onboarding.
+  `<repo-dir>/.github/workflows/<workflow>` for the explicit custom-CI path.
+- `set_repo_variables` writes non-secret repo/app identity GitHub Actions
+  Variables for custom CI when a GitHub token is available. It reports failures
+  in JSON and does not fail onboarding. Operators still need production values
+  for `MAP_CONTROL_ENDPOINT`, `MAP_AUTH_ENDPOINT`, and `MAP_PLATFORM_ENV`
+  before the custom-CI workflow can run.
 
 Access, publish, and canary:
 
@@ -138,7 +133,7 @@ Packaging and release:
 | `map evidence` | `GET /v1/map-control/deploy/evidence` |
 | `map rollback` | `POST /v1/map-control/deploy/rollback` |
 
-The BYO-CI template also calls:
+The custom-CI template also calls:
 
 - `GET $ACTIONS_ID_TOKEN_REQUEST_URL&audience=$MAP_OIDC_AUDIENCE` to obtain a
   GitHub OIDC token from Actions.
@@ -152,7 +147,7 @@ Save a MAP control login:
 
 ```bash
 map login save \
-  --map-control-endpoint https://control-plane.sandbox.mithran.cloud \
+  --map-control-endpoint https://map.example.com \
   --access-token "$MITHRAN_TOKEN" \
   --scope map:* \
   --scope audience:jason-controller
@@ -161,11 +156,11 @@ map login save \
 Use explicit endpoint and token for one command:
 
 ```bash
-map --endpoint https://control-plane.sandbox.mithran.cloud \
+map --endpoint https://map.example.com \
   --token "$MITHRAN_TOKEN" doctor
 ```
 
-Onboard a repository for the webhook-native path:
+Onboard a repository for the GitHub App webhook path:
 
 ```bash
 map onboard mithran-hq/demo \
@@ -173,7 +168,7 @@ map onboard mithran-hq/demo \
   --repo-dir ./demo
 ```
 
-Opt into the BYO-CI workflow:
+Opt into the custom-CI workflow:
 
 ```bash
 map onboard mithran-hq/demo \
@@ -187,7 +182,7 @@ Trigger a direct deploy request:
 ```bash
 map deploy \
   --repo mithran-hq/demo \
-  --env staging \
+  --env production \
   --ref refs/heads/release/1.2 \
   --installation-ref github-installation://131136661 \
   --app-ref app:demo
@@ -204,12 +199,12 @@ Start, promote, or rollback a Forge canary:
 
 ```bash
 map canary start demo \
-  --deployment-ref deployment://sandbox/production/demo-3 \
+  --deployment-ref <deployment-ref> \
   --weight 20
 map canary promote demo \
-  --deployment-ref deployment://sandbox/production/demo-3
+  --deployment-ref <deployment-ref>
 map canary rollback demo \
-  --deployment-ref deployment://sandbox/production/demo-3
+  --deployment-ref <deployment-ref>
 ```
 
 Plan and apply app access:
@@ -236,7 +231,7 @@ cargo run -- version
 cargo run -- validate --repo mithran-hq/demo --sha 0123456789abcdef0123456789abcdef01234567
 cargo run -- login save \
   --login-state /tmp/map-login.json \
-  --map-control-endpoint https://control-plane.sandbox.mithran.cloud \
+  --map-control-endpoint https://map.example.com \
   --access-token test-token \
   --scope map:*
 python3 scripts/package_host_component.py \
@@ -249,15 +244,13 @@ python3 scripts/package_host_component.py \
 
 Evidence locations:
 
-- `templates/map-deploy.yml` is the BYO-CI workflow template.
+- `templates/map-deploy.yml` is the custom-CI workflow template.
 - `target/map-cli-component.tar.gz` is the generic package smoke output.
 - `dist/map-cli/` is the host component output directory.
 - `mithran.yaml` is the scaffolded app manifest written into a tenant repo.
 - `access.yaml` is the app access policy input file read by `map access`.
 
-This repo has no local ADR or runbook tree. The operative Forge and MAP
-architecture references are the central Forge docs linked above plus the root
-`README.md`.
+The root `README.md` is the high-level MAP CLI reference for this repo.
 
 ## Symptom Triage
 
@@ -269,7 +262,7 @@ architecture references are the central Forge docs linked above plus the root
 | Deploy request is rejected by source policy | Check `--repo`, `--installation-ref`, `--app-ref`, tenant/account refs, and the control-plane source registry binding created by `map onboard`. |
 | `map onboard` returns conflict with an install URL | Install or grant the GitHub App at the returned URL, then rerun `map onboard`; the command is designed to be idempotent. |
 | `map onboard --with-ci-workflow` reports variable failures | Check `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`, plus repo permissions for Actions Variables. The variables are non-secret `MAP_*` values. |
-| BYO-CI workflow cannot mint a token | Check `id-token: write`, `MAP_AUTH_ENDPOINT`, `MAP_OIDC_AUDIENCE`, and whether the repository has an active onboarding binding. |
+| Custom-CI workflow cannot mint a token | Check `id-token: write`, `MAP_AUTH_ENDPOINT`, `MAP_OIDC_AUDIENCE`, and whether the repository has an active onboarding binding. |
 | `map doctor` fails config or route checks | Check the saved endpoint, token, `/v1/map-control/config`, `/v1/map-control/routes/status`, and whether the app has an allowlist or registry binding. |
 | `map logs` fails | This is expected: the live control plane exposes no deploy logs route. Use `map status` or `map evidence`. |
 | `map versions` shows no published version | The app has addressable internal versions but no external published pointer. Run `map publish` after a version has passed server review. |
@@ -283,7 +276,6 @@ architecture references are the central Forge docs linked above plus the root
 Before closing a Forge CLI docs or behavior task:
 
 - The docs index links this guide.
-- This guide links the central Forge docs.
 - CLI-owned behavior is separated from control-plane, Auth, sidecar,
   runtime-control, Aegis package assembly, and Jason authority.
 - Route, command, source path, and packaging claims match local source.
