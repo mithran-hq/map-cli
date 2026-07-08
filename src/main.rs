@@ -234,8 +234,9 @@ struct OnboardArgs {
     #[arg(long)]
     account_ref: Option<String>,
 
-    /// Project ref; defaults to `app:<repo-name>`.
-    #[arg(long)]
+    /// Project/app ref; defaults to `app:<repo-name>`. In self-service onboarding this is also
+    /// the app identity used by deploy routing, version, and publish surfaces.
+    #[arg(long, visible_alias = "app-ref")]
     project_ref: Option<String>,
 
     /// Local checkout to scaffold `mithran.yaml` (and, with `--with-ci-workflow`, the deploy
@@ -916,33 +917,53 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
         "commit + push mithran.yaml, then push a release/* ref (or tag) — the webhook deploys (no repo workflow needed)"
     };
 
-    print_json_or_text(
-        cli.json,
-        json!({
-            "ok": true,
-            "schema_version": "map.onboard.v1",
-            "repo": args.repo,
-            "onboard": value,
-            "ci_workflow": args.with_ci_workflow,
-            "workflow_written": workflow_path.as_ref().map(|p| p.display().to_string()),
-            "manifest_written": manifest_path.as_ref().map(|p| p.display().to_string()),
-            "variables": variables_outcome,
-            "next": next,
-        }),
-        &format!(
-            "onboarded {} (registry binding recorded).{}{}\nnext: {}.",
-            args.repo,
-            workflow_path
-                .as_ref()
-                .map(|p| format!("\nwrote {}", p.display()))
-                .unwrap_or_default(),
-            manifest_path
-                .as_ref()
-                .map(|p| format!("\nwrote {}", p.display()))
-                .unwrap_or_default(),
-            next,
-        ),
-    )
+    let (payload, text) = onboard_output(
+        &args.repo,
+        &project_ref,
+        value,
+        args.with_ci_workflow,
+        workflow_path.as_ref(),
+        manifest_path.as_ref(),
+        variables_outcome,
+        next,
+    );
+    print_json_or_text(cli.json, payload, &text)
+}
+
+fn onboard_output(
+    repo: &str,
+    project_ref: &str,
+    onboard: Value,
+    ci_workflow: bool,
+    workflow_path: Option<&PathBuf>,
+    manifest_path: Option<&PathBuf>,
+    variables: Value,
+    next: &str,
+) -> (Value, String) {
+    let payload = json!({
+        "ok": true,
+        "schema_version": "map.onboard.v1",
+        "repo": repo,
+        "project_ref": project_ref,
+        "app_ref": project_ref,
+        "identity_note": "project_ref is also the self-service app identity used by deploy routing, version, and publish surfaces",
+        "onboard": onboard,
+        "ci_workflow": ci_workflow,
+        "workflow_written": workflow_path.map(|p| p.display().to_string()),
+        "manifest_written": manifest_path.map(|p| p.display().to_string()),
+        "variables": variables,
+        "next": next,
+    });
+    let text = format!(
+        "onboarded {repo} (registry binding recorded).\napp identity: {project_ref} (stored as identity.project_ref; used for deploy routing, versions, and publish).{}{}\nnext: {next}.",
+        workflow_path
+            .map(|p| format!("\nwrote {}", p.display()))
+            .unwrap_or_default(),
+        manifest_path
+            .map(|p| format!("\nwrote {}", p.display()))
+            .unwrap_or_default(),
+    );
+    (payload, text)
 }
 
 /// ADR-0019: the `access.yaml` schema — an app's access policy declared as code. Every field
@@ -2380,6 +2401,60 @@ mod tests {
     }
 
     #[test]
+    fn onboard_help_explains_project_ref_is_app_identity() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("onboard")
+            .expect("onboard command")
+            .render_help()
+            .to_string();
+
+        assert!(help.contains("--project-ref"));
+        assert!(help.contains("--app-ref"));
+        assert!(help.contains("app identity"), "got: {help}");
+        assert!(help.contains("deploy routing"), "got: {help}");
+        assert!(help.contains("version"), "got: {help}");
+        assert!(help.contains("publish"), "got: {help}");
+    }
+
+    #[test]
+    fn onboard_accepts_app_ref_alias_without_breaking_project_ref() {
+        let project_cli = Cli::try_parse_from([
+            "map",
+            "onboard",
+            "john-smith/my-app",
+            "--installation-ref",
+            "github-installation://131136661",
+            "--project-ref",
+            "app:from-project",
+        ])
+        .expect("project-ref parses");
+        match project_cli.command {
+            Command::Onboard(args) => {
+                assert_eq!(args.project_ref.as_deref(), Some("app:from-project"));
+            }
+            _ => panic!("expected onboard"),
+        }
+
+        let app_cli = Cli::try_parse_from([
+            "map",
+            "onboard",
+            "john-smith/my-app",
+            "--installation-ref",
+            "github-installation://131136661",
+            "--app-ref",
+            "app:from-app",
+        ])
+        .expect("app-ref alias parses");
+        match app_cli.command {
+            Command::Onboard(args) => {
+                assert_eq!(args.project_ref.as_deref(), Some("app:from-app"));
+            }
+            _ => panic!("expected onboard"),
+        }
+    }
+
+    #[test]
     fn onboard_requires_installation_ref() {
         assert!(Cli::try_parse_from(["map", "onboard", "john-smith/my-app"]).is_err());
     }
@@ -2429,6 +2504,32 @@ mod tests {
         );
         // an absent optional ref is omitted (not set to empty).
         assert!(!vars.contains_key("MAP_ACCOUNT_REF"));
+    }
+
+    #[test]
+    fn onboard_output_names_resolved_app_identity() {
+        let (payload, text) = onboard_output(
+            "john-smith/my-app",
+            "app:my-app",
+            json!({ "binding": "ok" }),
+            true,
+            Some(&PathBuf::from(".github/workflows/map-deploy.yml")),
+            Some(&PathBuf::from("mithran.yaml")),
+            json!({ "set": true }),
+            "commit + push",
+        );
+
+        assert_eq!(payload["project_ref"], "app:my-app");
+        assert_eq!(payload["app_ref"], "app:my-app");
+        assert!(payload["identity_note"]
+            .as_str()
+            .unwrap()
+            .contains("deploy routing"));
+        assert!(text.contains("app identity: app:my-app"), "got: {text}");
+        assert!(text.contains("identity.project_ref"), "got: {text}");
+        assert!(text.contains("deploy routing"), "got: {text}");
+        assert!(text.contains("versions"), "got: {text}");
+        assert!(text.contains("publish"), "got: {text}");
     }
 
     #[test]
