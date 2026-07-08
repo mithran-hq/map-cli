@@ -63,8 +63,8 @@ Deploy and status flow:
   `Succeeded` is success; `Failed`, `Superseded`, `RolledBack`,
   `ReviewBlocked`, `BuildFailed`, `RuntimeFailed`, and `RouteFailed` fail the
   watch.
-- `logs` intentionally returns a CLI error because the live control plane does
-  not expose a deploy logs route.
+- `logs` GETs `/v1/map-control/deploy/logs` with `deployment_ref` and renders
+  the returned source, review, build, runtime, and route phase entries.
 - `evidence` GETs `/v1/map-control/deploy/evidence`.
 - `rollback` POSTs `/v1/map-control/deploy/rollback`.
 
@@ -264,7 +264,7 @@ The root `README.md` is the high-level MAP CLI reference for this repo.
 | `map onboard --with-ci-workflow` reports variable failures | Check `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`, plus repo permissions for Actions Variables. The variables are non-secret `MAP_*` values. |
 | Custom-CI workflow cannot mint a token | Check `id-token: write`, `MAP_AUTH_ENDPOINT`, `MAP_OIDC_AUDIENCE`, and whether the repository has an active onboarding binding. |
 | `map doctor` fails config or route checks | Check the saved endpoint, token, `/v1/map-control/config`, `/v1/map-control/routes/status`, and whether the app has an allowlist or registry binding. |
-| `map logs` fails | This is expected: the live control plane exposes no deploy logs route. Use `map status` or `map evidence`. |
+| `map logs` reports logs are unavailable | The saved endpoint may be an older control-plane build without `/v1/map-control/deploy/logs`. Use `map status` or `map evidence`, or point the CLI at a current control-plane endpoint. |
 | `map versions` shows no published version | The app has addressable internal versions but no external published pointer. Run `map publish` after a version has passed server review. |
 | `map publish` returns 409 | The version is stale or not publishable. Re-run `map versions`, verify the reviewed succeeded deployment, and pass the current `--expected-sha` if using the stale-safe guard. |
 | `map canary start` rejects `--weight` | Use an integer from 1 through 99. Use `promote` for 100% and `rollback` to clear the split. |

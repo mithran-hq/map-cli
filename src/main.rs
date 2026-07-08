@@ -18,6 +18,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAP_DEPLOY_WORKFLOW_TEMPLATE: &str = include_str!("../templates/map-deploy.yml");
 
 const USER_AGENT: &str = concat!("map-cli/", env!("CARGO_PKG_VERSION"));
+const DEPLOY_LOGS_PATH: &str = "/v1/map-control/deploy/logs";
 const CANARY_DEPLOY_PATH: &str = "/v1/map-control/deploy/canary";
 const LIVE_ADAPTER_MODE: &str = "sandbox-live";
 const DEFAULT_STARTER_RUNTIME: &str = "nodejs22";
@@ -96,7 +97,8 @@ enum Command {
     /// Poll deploy status until success, failure, or timeout.
     #[command(after_help = AUTH_FLAGS_HELP)]
     Watch(WatchArgs),
-    /// Explain where to inspect deploy status and evidence.
+    /// Show deploy phase logs for a deployment ref.
+    #[command(after_help = AUTH_FLAGS_HELP)]
     Logs(IdArgs),
     /// Show deploy evidence for a deployment ref.
     #[command(after_help = AUTH_FLAGS_HELP)]
@@ -557,10 +559,7 @@ fn run(cli: Cli) -> Result<(), String> {
             &[("deployment_ref", args.id.as_str())],
         ),
         Command::Watch(args) => watch(&cli, args),
-        Command::Logs(_) => Err(
-            "deployment logs are not available yet; use `map --json status <deployment-ref>` for deployment state or `map --json evidence <deployment-ref>` for review evidence"
-                .to_string(),
-        ),
+        Command::Logs(args) => map_logs(&cli, args),
         Command::Evidence(args) => get(
             &cli,
             "/v1/map-control/deploy/evidence",
@@ -740,8 +739,54 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
     }
 }
 
+fn map_logs(cli: &Cli, args: &IdArgs) -> Result<(), String> {
+    let (client, state) = client(cli)?;
+    let response = client
+        .get(format!(
+            "{}{}",
+            state.map_control_endpoint.trim_end_matches('/'),
+            DEPLOY_LOGS_PATH
+        ))
+        .query(&[("deployment_ref", args.id.as_str())])
+        .bearer_auth(&state.access_token)
+        .send()
+        .map_err(|error| format!("MAP request failed: {error}"))?;
+    let value = parse_deploy_logs_response(response.status(), response.text())?;
+    if cli.json {
+        println!("{}", serde_json::to_string(&value).unwrap());
+    } else {
+        print!("{}", render_deploy_logs_text(&value));
+    }
+    Ok(())
+}
+
 fn read_watch_response(response: reqwest::blocking::Response) -> Result<Value, String> {
     parse_watch_response(response.status(), response.text())
+}
+
+fn parse_deploy_logs_response(
+    status: StatusCode,
+    text: Result<String, reqwest::Error>,
+) -> Result<Value, String> {
+    let text = text.map_err(|error| format!("read MAP logs response: {error}"))?;
+    if status == StatusCode::NOT_FOUND && deploy_logs_route_absent(&text) {
+        return Err(deploy_logs_unavailable_hint().to_string());
+    }
+    if !status.is_success() {
+        return Err(format!("MAP returned {status}: {}", redact(&text)));
+    }
+    serde_json::from_str(&text).map_err(|error| format!("read MAP logs response: {error}"))
+}
+
+fn deploy_logs_route_absent(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("route not found")
+        || lower.contains("no route matched")
+        || (lower.contains(DEPLOY_LOGS_PATH) && !lower.contains("deployment logs not found"))
+}
+
+fn deploy_logs_unavailable_hint() -> &'static str {
+    "deployment logs are not available yet; use `map --json status <deployment-ref>` for deployment state or `map --json evidence <deployment-ref>` for review evidence"
 }
 
 fn parse_watch_response(
@@ -753,6 +798,74 @@ fn parse_watch_response(
         return Err(format!("MAP returned {status}: {}", redact(&text)));
     }
     serde_json::from_str(&text).map_err(|error| format!("read MAP watch response: {error}"))
+}
+
+fn render_deploy_logs_text(payload: &Value) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "deployment_ref: {}\n",
+        payload
+            .get("deployment_ref")
+            .and_then(Value::as_str)
+            .unwrap_or("(not returned)")
+    ));
+    if let Some(status) = payload.get("deployment_status").and_then(Value::as_str) {
+        out.push_str(&format!("deployment_status: {status}\n"));
+    }
+
+    let phases = payload
+        .get("phases")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !phases.is_empty() {
+        out.push('\n');
+    }
+    for phase in phases {
+        let name = phase
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("phase");
+        let status = phase
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let message = phase
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("no message returned");
+        out.push_str(&format!("{name}: {status} - {message}\n"));
+        if let Some(refs) = phase.get("refs").and_then(Value::as_object) {
+            for (key, value) in refs {
+                out.push_str(&format!("  {key}: {}\n", render_json_value(value)));
+            }
+        }
+        if let Some(details) = phase.get("details") {
+            append_deploy_log_details(&mut out, details);
+        }
+    }
+    out
+}
+
+fn append_deploy_log_details(out: &mut String, details: &Value) {
+    match details {
+        Value::Object(map) => {
+            for (key, value) in map {
+                out.push_str(&format!("  detail.{key}: {}\n", render_json_value(value)));
+            }
+        }
+        _ => out.push_str(&format!("  details: {}\n", render_json_value(details))),
+    }
+}
+
+fn render_json_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => "null".to_string(),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap(),
+    }
 }
 
 /// Terminal deployment phases reported by the control-plane deploy state
@@ -2548,6 +2661,7 @@ mod tests {
             &["canary", "rollback"][..],
             &["status"][..],
             &["watch"][..],
+            &["logs"][..],
             &["evidence"][..],
             &["rollback"][..],
         ] {
@@ -2962,16 +3076,11 @@ mod tests {
     }
 
     #[test]
-    fn logs_unsupported_error_points_to_supported_investigation_commands() {
-        let err = run(Cli {
-            login_state: None,
-            endpoint: None,
-            token: None,
-            json: false,
-            command: Command::Logs(IdArgs {
-                id: "deployment://sandbox/production/demo-1".to_string(),
-            }),
-        })
+    fn logs_old_server_route_missing_falls_back_to_supported_investigation_commands() {
+        let err = parse_deploy_logs_response(
+            StatusCode::NOT_FOUND,
+            Ok(r#"{"status":"error","message":"route not found"}"#.to_string()),
+        )
         .unwrap_err();
 
         assert!(err.contains("map --json status <deployment-ref>"));
@@ -2980,6 +3089,97 @@ mod tests {
         assert!(!err.contains("control-plane"));
         assert!(!err.contains("route"));
         assert!(!err.contains("server"));
+    }
+
+    #[test]
+    fn logs_missing_deployment_404_remains_a_real_map_error() {
+        let err = parse_deploy_logs_response(
+            StatusCode::NOT_FOUND,
+            Ok(r#"{"status":"error","message":"deployment logs not found"}"#.to_string()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            r#"MAP returned 404 Not Found: {"status":"error","message":"deployment logs not found"}"#
+        );
+    }
+
+    #[test]
+    fn logs_response_parses_and_json_mode_preserves_server_shape() {
+        let raw = r#"{
+            "status": "ok",
+            "schema_version": "map-deploy-logs/v1",
+            "deployment_ref": "deployment://production/app/demo-1",
+            "deployment_status": "Succeeded",
+            "phases": [],
+            "server_extra": { "kept": true }
+        }"#;
+
+        let value =
+            parse_deploy_logs_response(StatusCode::OK, Ok(raw.to_string())).expect("valid logs");
+        let round_trip: Value =
+            serde_json::from_str(&serde_json::to_string(&value).unwrap()).unwrap();
+
+        assert_eq!(round_trip["schema_version"], "map-deploy-logs/v1");
+        assert_eq!(round_trip["server_extra"]["kept"], true);
+    }
+
+    #[test]
+    fn logs_text_renders_phase_refs_missing_markers_and_failure_details() {
+        let payload = json!({
+            "status": "ok",
+            "schema_version": "map-deploy-logs/v1",
+            "deployment_ref": "deployment://production/app/demo-1",
+            "deployment_status": "RuntimeFailed",
+            "phases": [
+                {
+                    "phase": "source",
+                    "status": "available",
+                    "message": "source snapshot recorded",
+                    "refs": {
+                        "source_snapshot_ref": "gcs://mithran-source/app/source.tar",
+                        "manifest_digest": "sha256:manifest"
+                    }
+                },
+                {
+                    "phase": "build",
+                    "status": "available",
+                    "message": "build log reference recorded",
+                    "refs": {
+                        "logs_ref": "gcs://mithran-build-logs/build-123.log"
+                    }
+                },
+                {
+                    "phase": "runtime",
+                    "status": "available",
+                    "message": "runtime detail recorded",
+                    "refs": {
+                        "runtime_status": "Failed"
+                    },
+                    "details": {
+                        "reason": "raw_firecracker_app_readiness_timeout",
+                        "message": "runtime app readiness probe timed out"
+                    }
+                },
+                {
+                    "phase": "route",
+                    "status": "not_captured",
+                    "message": "no route log captured",
+                    "refs": {}
+                }
+            ]
+        });
+
+        let rendered = render_deploy_logs_text(&payload);
+
+        assert!(rendered.contains("deployment_ref: deployment://production/app/demo-1"));
+        assert!(rendered.contains("deployment_status: RuntimeFailed"));
+        assert!(rendered.contains("source: available - source snapshot recorded"));
+        assert!(rendered.contains("logs_ref: gcs://mithran-build-logs/build-123.log"));
+        assert!(rendered.contains("detail.reason: raw_firecracker_app_readiness_timeout"));
+        assert!(rendered.contains("detail.message: runtime app readiness probe timed out"));
+        assert!(rendered.contains("route: not_captured - no route log captured"));
     }
 
     #[test]
