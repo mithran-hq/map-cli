@@ -260,7 +260,7 @@ The root `README.md` is the high-level MAP CLI reference for this repo.
 | `print-token` rejects the requested audience | Check login state `audience` and `scopes`. The state must match the requested audience, contain `map:*`, or contain `audience:<audience>`. |
 | Deploy target validation fails | Pass exactly one usable source selector: `--ref <git-ref>` or `--sha <40-hex-sha>`. |
 | Deploy request is rejected by source policy | Check `--repo`, `--installation-ref`, `--app-ref`, tenant/account refs, and the control-plane source registry binding created by `map onboard`. |
-| `map onboard` returns conflict with an install URL | Install or grant the GitHub App at the returned URL, then rerun `map onboard`; the command is designed to be idempotent. |
+| `map onboard` returns a non-success response | Keep the redacted response body, then verify the repo slug, installation ref, account context, GitHub App grant, and control-plane source registry configuration before retrying. |
 | `map onboard --with-ci-workflow` reports variable failures | Check `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`, plus repo permissions for Actions Variables. The variables are non-secret `MAP_*` values. |
 | Custom-CI workflow cannot mint a token | Check `id-token: write`, `MAP_AUTH_ENDPOINT`, `MAP_OIDC_AUDIENCE`, and whether the repository has an active onboarding binding. |
 | `map doctor` fails config or route checks | Check the saved endpoint, token, `/v1/map-control/config`, `/v1/map-control/routes/status`, and whether the app has an allowlist or registry binding. |

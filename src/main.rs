@@ -916,7 +916,7 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
     let text = response
         .text()
         .map_err(|error| format!("read onboard response: {error}"))?;
-    let value = parse_onboard_response(status, &text, &args.repo)?;
+    let value = parse_onboard_response(status, &text)?;
 
     let manifest_path = scaffold_manifest(args.repo_dir.as_ref(), repo_name, &project_ref)?;
 
@@ -954,21 +954,9 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
     print_json_or_text(cli.json, payload, &text)
 }
 
-fn parse_onboard_response(status: StatusCode, text: &str, repo: &str) -> Result<Value, String> {
+fn parse_onboard_response(status: StatusCode, text: &str) -> Result<Value, String> {
     let value = serde_json::from_str::<Value>(text).ok();
-    // The repo grant is missing; guide the developer to finish the GitHub App install/grant,
-    // then re-run. Onboarding is idempotent.
     if status == StatusCode::CONFLICT {
-        if let Some(url) = value
-            .as_ref()
-            .and_then(|value| value.get("install_url"))
-            .and_then(Value::as_str)
-        {
-            return Err(format!(
-                "GitHub App grant required for {}: install/grant it at {} then re-run `map onboard`",
-                repo, url
-            ));
-        }
         let body = onboard_error_body(value.as_ref(), text);
         return Err(format!("onboard conflict: {}", redact(&body)));
     }
@@ -2755,7 +2743,6 @@ mod tests {
         let err = parse_onboard_response(
             StatusCode::FORBIDDEN,
             r#"{"status":"error","message":"Bearer access_token denied"}"#,
-            "mithran-hq/demo",
         )
         .unwrap_err();
 
@@ -2770,7 +2757,6 @@ mod tests {
         let err = parse_onboard_response(
             StatusCode::BAD_GATEWAY,
             "upstream proxy rejected Bearer token before JSON",
-            "mithran-hq/demo",
         )
         .unwrap_err();
 
@@ -2781,11 +2767,10 @@ mod tests {
     }
 
     #[test]
-    fn onboard_response_preserves_json_conflict_body_without_install_url() {
+    fn onboard_response_preserves_json_conflict_body() {
         let err = parse_onboard_response(
             StatusCode::CONFLICT,
             r#"{"status":"error","message":"already bound"}"#,
-            "mithran-hq/demo",
         )
         .unwrap_err();
 
@@ -2796,17 +2781,16 @@ mod tests {
     }
 
     #[test]
-    fn onboard_response_keeps_install_url_guidance() {
+    fn onboard_response_preserves_non_json_conflict_body() {
         let err = parse_onboard_response(
             StatusCode::CONFLICT,
-            r#"{"install_url":"https://github.com/apps/mithran/installations/new","status":"grant_required"}"#,
-            "mithran-hq/demo",
+            "repository binding conflict for Bearer token",
         )
         .unwrap_err();
 
         assert_eq!(
             err,
-            "GitHub App grant required for mithran-hq/demo: install/grant it at https://github.com/apps/mithran/installations/new then re-run `map onboard`"
+            "onboard conflict: repository binding conflict for [REDACTED] token"
         );
     }
 
