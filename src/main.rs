@@ -20,6 +20,8 @@ const MAP_DEPLOY_WORKFLOW_TEMPLATE: &str = include_str!("../templates/map-deploy
 const USER_AGENT: &str = concat!("map-cli/", env!("CARGO_PKG_VERSION"));
 const CANARY_DEPLOY_PATH: &str = "/v1/map-control/deploy/canary";
 const LIVE_ADAPTER_MODE: &str = "sandbox-live";
+const DEFAULT_STARTER_RUNTIME: &str = "nodejs22";
+const DEFAULT_STARTER_COMMAND: &str = "npm start";
 
 #[derive(Parser)]
 #[command(name = "map", version, about = "Thin MAP client for Aegis.app")]
@@ -481,7 +483,7 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             fs::write(
                 &args.manifest,
-                "schema_version: mithran.map.v1\nname: example\n",
+                starter_manifest("example", "Example", "app:example"),
             )
             .map_err(|error| format!("write {}: {error}", args.manifest.display()))?;
             print_json_or_text(
@@ -891,7 +893,7 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
         ));
     }
 
-    let manifest_path = scaffold_manifest(args.repo_dir.as_ref(), repo_name)?;
+    let manifest_path = scaffold_manifest(args.repo_dir.as_ref(), repo_name, &project_ref)?;
 
     // Webhook-native default (ADR-0016 amendment): the App installation + webhook is the deploy
     // trigger, so onboard writes NO repo workflow and touches no repo Actions config — zero repo
@@ -1166,7 +1168,11 @@ fn scaffold_deploy_workflow(
 }
 
 /// Write a starter `<repo_dir>/mithran.yaml` if one is not already present (never clobbers).
-fn scaffold_manifest(repo_dir: Option<&PathBuf>, name: &str) -> Result<Option<PathBuf>, String> {
+fn scaffold_manifest(
+    repo_dir: Option<&PathBuf>,
+    app_id: &str,
+    project_ref: &str,
+) -> Result<Option<PathBuf>, String> {
     let Some(repo_dir) = repo_dir else {
         return Ok(None);
     };
@@ -1174,12 +1180,49 @@ fn scaffold_manifest(repo_dir: Option<&PathBuf>, name: &str) -> Result<Option<Pa
     if path.exists() {
         return Ok(None);
     }
-    fs::write(
-        &path,
-        format!("schema_version: mithran.map.v1\nname: {name}\n"),
-    )
-    .map_err(|error| format!("write {}: {error}", path.display()))?;
+    fs::write(&path, starter_manifest(app_id, app_id, project_ref))
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
     Ok(Some(path))
+}
+
+fn starter_manifest(app_id: &str, name: &str, project_ref: &str) -> String {
+    let app_id = yaml_double_quoted(app_id);
+    let name = yaml_double_quoted(name);
+    let project_ref = yaml_double_quoted(project_ref);
+    format!(
+        "apiVersion: map.mithran/v1
+kind: MithranApp
+metadata:
+  app_id: {app_id}
+  name: {name}
+identity:
+  project_ref: {project_ref}
+capabilities:
+  - kind: http
+    route: /
+    runtime: {DEFAULT_STARTER_RUNTIME}
+    startup:
+      command: {DEFAULT_STARTER_COMMAND}
+"
+    )
+}
+
+fn yaml_double_quoted(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            ch if ch.is_control() => quoted.push_str(&format!("\\x{:02X}", ch as u32)),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn setup(cli: &Cli, args: &SetupArgs) -> Result<(), String> {
@@ -2011,6 +2054,31 @@ mod tests {
         path
     }
 
+    fn assert_starter_manifest(body: &str, app_id: &str, name: &str, project_ref: &str) {
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(body).expect("starter manifest is valid yaml");
+        assert_eq!(parsed["apiVersion"].as_str(), Some("map.mithran/v1"));
+        assert_eq!(parsed["kind"].as_str(), Some("MithranApp"));
+        assert_eq!(parsed["metadata"]["app_id"].as_str(), Some(app_id));
+        assert_eq!(parsed["metadata"]["name"].as_str(), Some(name));
+        assert_eq!(
+            parsed["identity"]["project_ref"].as_str(),
+            Some(project_ref)
+        );
+        assert_eq!(parsed["capabilities"][0]["kind"].as_str(), Some("http"));
+        assert_eq!(parsed["capabilities"][0]["route"].as_str(), Some("/"));
+        assert_eq!(
+            parsed["capabilities"][0]["runtime"].as_str(),
+            Some("nodejs22")
+        );
+        assert_eq!(
+            parsed["capabilities"][0]["startup"]["command"].as_str(),
+            Some("npm start")
+        );
+        assert!(!body.contains("schema_version"));
+        assert!(!body.contains("schema_version: mithran.map.v1"));
+    }
+
     // ADR-0019: access.yaml resolves into the control-plane request body; a declared policy
     // defaults to protected and carries the domains + share verbatim.
     #[test]
@@ -2311,6 +2379,57 @@ mod tests {
     }
 
     #[test]
+    fn starter_manifest_quotes_dynamic_yaml_scalars() {
+        let body = starter_manifest(
+            "null",
+            "Needs \"quotes\"",
+            "project: custom # not a comment [literal]\nline",
+        );
+
+        assert_starter_manifest(
+            &body,
+            "null",
+            "Needs \"quotes\"",
+            "project: custom # not a comment [literal]\nline",
+        );
+    }
+
+    #[test]
+    fn init_writes_starter_mithran_app_and_does_not_clobber() {
+        let path = env::temp_dir().join(format!("map-init-test-{}.yaml", std::process::id()));
+        let _ = fs::remove_file(&path);
+
+        run(Cli {
+            login_state: None,
+            endpoint: None,
+            token: None,
+            json: false,
+            command: Command::Init(InitArgs {
+                manifest: path.clone(),
+            }),
+        })
+        .expect("init writes manifest");
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert_starter_manifest(&body, "example", "Example", "app:example");
+
+        let err = run(Cli {
+            login_state: None,
+            endpoint: None,
+            token: None,
+            json: false,
+            command: Command::Init(InitArgs {
+                manifest: path.clone(),
+            }),
+        })
+        .unwrap_err();
+        assert!(err.contains("already exists"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn scaffold_helpers_write_and_do_not_clobber() {
         let dir = env::temp_dir().join(format!("map-onboard-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2325,16 +2444,18 @@ mod tests {
             MAP_DEPLOY_WORKFLOW_TEMPLATE
         );
 
-        let manifest = scaffold_manifest(Some(&dir), "my-app")
+        let manifest = scaffold_manifest(Some(&dir), "my-app", "project:custom")
             .expect("ok")
             .expect("path");
         let body = fs::read_to_string(&manifest).unwrap();
-        assert!(body.contains("schema_version: mithran.map.v1"));
-        assert!(body.contains("name: my-app"));
+        assert_starter_manifest(&body, "my-app", "my-app", "project:custom");
 
         // existing manifest is never clobbered.
         fs::write(&manifest, "name: edited-by-user\n").unwrap();
-        assert_eq!(scaffold_manifest(Some(&dir), "my-app").expect("ok"), None);
+        assert_eq!(
+            scaffold_manifest(Some(&dir), "my-app", "project:custom").expect("ok"),
+            None
+        );
         assert_eq!(
             fs::read_to_string(&manifest).unwrap(),
             "name: edited-by-user\n"
@@ -2345,7 +2466,10 @@ mod tests {
             scaffold_deploy_workflow(None, "map-deploy.yml").unwrap(),
             None
         );
-        assert_eq!(scaffold_manifest(None, "my-app").unwrap(), None);
+        assert_eq!(
+            scaffold_manifest(None, "my-app", "project:custom").unwrap(),
+            None
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
