@@ -1,5 +1,4 @@
 use clap::{Args, Parser, Subcommand};
-use map_deploy_review_contract::{MapDeployReviewContract, MapDeployReviewStatus};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -61,8 +60,6 @@ enum Command {
     Doctor(DoctorArgs),
     /// Write a starter mithran.yaml manifest.
     Init(InitArgs),
-    /// Review mithran.yaml locally before deploy.
-    DeployReview(DeployReviewArgs),
     /// Validate a deploy request without deploying.
     Validate(DeployTarget),
     /// Request a deploy directly. Built-in GitHub App webhooks are preferred for standard refs.
@@ -154,17 +151,6 @@ struct PrintTokenArgs {
 #[derive(Args, Serialize)]
 struct InitArgs {
     /// Manifest path to create.
-    #[arg(long, default_value = "mithran.yaml")]
-    manifest: PathBuf,
-}
-
-#[derive(Args)]
-struct DeployReviewArgs {
-    /// Repository root used to resolve the manifest path.
-    #[arg(long, default_value = ".")]
-    repo_root: PathBuf,
-
-    /// Manifest path to review. Relative paths resolve under --repo-root.
     #[arg(long, default_value = "mithran.yaml")]
     manifest: PathBuf,
 }
@@ -529,7 +515,6 @@ fn run(cli: Cli) -> Result<(), String> {
                 "created mithran.yaml",
             )
         }
-        Command::DeployReview(args) => deploy_review(&cli, args),
         Command::Validate(target) => {
             validate_target(target)?;
             print_json_or_text(cli.json, json!({ "ok": true }), "target is valid")
@@ -649,64 +634,6 @@ fn validate_target(target: &DeployTarget) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn deploy_review(cli: &Cli, args: &DeployReviewArgs) -> Result<(), String> {
-    let path = deploy_review_manifest_path(args);
-    let manifest = read_deploy_review_manifest(&path)?;
-    let review = map_deploy_review_contract::review_manifest(
-        manifest.as_deref(),
-        path.display().to_string(),
-    );
-    emit_deploy_review(cli.json, &review)
-}
-
-fn deploy_review_manifest_path(args: &DeployReviewArgs) -> PathBuf {
-    if args.manifest.is_absolute() {
-        args.manifest.clone()
-    } else {
-        args.repo_root.join(&args.manifest)
-    }
-}
-
-fn read_deploy_review_manifest(path: &PathBuf) -> Result<Option<String>, String> {
-    match fs::read_to_string(path) {
-        Ok(manifest) => Ok(Some(manifest)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("read manifest {}: {error}", path.display())),
-    }
-}
-
-fn emit_deploy_review(json_output: bool, review: &MapDeployReviewContract) -> Result<(), String> {
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(review).unwrap());
-    }
-
-    match review.status {
-        MapDeployReviewStatus::Passed => {
-            if !json_output {
-                println!("deploy review passed: {}", review.manifest_path);
-            }
-            Ok(())
-        }
-        MapDeployReviewStatus::Blocked => Err(format_deploy_review_blocked(review)),
-    }
-}
-
-fn format_deploy_review_blocked(review: &MapDeployReviewContract) -> String {
-    let finding_count = review.findings.len();
-    let mut lines = vec![format!(
-        "deploy review blocked: {finding_count} finding{} in {}",
-        if finding_count == 1 { "" } else { "s" },
-        review.manifest_path
-    )];
-    for finding in &review.findings {
-        lines.push(format!(
-            "  {} {}: {}",
-            finding.code, finding.path, finding.message
-        ));
-    }
-    lines.join("\n")
 }
 
 fn build_client() -> Result<Client, String> {
@@ -2547,117 +2474,6 @@ mod tests {
     }
 
     #[test]
-    fn deploy_review_parses_default_manifest_inputs() {
-        let cli = Cli::try_parse_from(["map", "deploy-review"]).expect("parses");
-        match cli.command {
-            Command::DeployReview(args) => {
-                assert_eq!(args.repo_root, PathBuf::from("."));
-                assert_eq!(args.manifest, PathBuf::from("mithran.yaml"));
-                assert_eq!(
-                    deploy_review_manifest_path(&args),
-                    PathBuf::from(".").join("mithran.yaml")
-                );
-            }
-            _ => panic!("expected deploy-review"),
-        }
-    }
-
-    #[test]
-    fn deploy_review_uses_control_plane_contract_codes() {
-        let review = map_deploy_review_contract::review_manifest(
-            Some(
-                r#"
-apiVersion: wrong/v0
-kind: MithranApp
-metadata: {app_id: acme, name: Acme}
-identity: {project_ref: owner/repo}
-"#,
-            ),
-            "mithran.yaml",
-        );
-
-        assert_eq!(
-            review.schema_version,
-            map_deploy_review_contract::MAP_DEPLOY_REVIEW_CONTRACT_SCHEMA
-        );
-        assert_eq!(review.status, MapDeployReviewStatus::Blocked);
-        assert_eq!(review.finding_codes, vec!["ERR_API_VERSION"]);
-        assert_eq!(
-            format_deploy_review_blocked(&review),
-            "deploy review blocked: 1 finding in mithran.yaml\n  ERR_API_VERSION apiVersion: apiVersion must be map.mithran/v1"
-        );
-    }
-
-    #[test]
-    fn deploy_review_missing_manifest_is_a_contract_result() {
-        let path = temp_file_path("missing-mithran-yaml");
-        let _ = fs::remove_file(&path);
-        let manifest = read_deploy_review_manifest(&path).expect("missing is handled");
-        let review = map_deploy_review_contract::review_manifest(
-            manifest.as_deref(),
-            path.display().to_string(),
-        );
-
-        assert_eq!(review.status, MapDeployReviewStatus::Blocked);
-        assert_eq!(review.finding_codes, vec!["ERR_MANIFEST_MISSING"]);
-        assert_eq!(review.findings[0].path, path.display().to_string());
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct DeployReviewFixture {
-        name: String,
-        #[serde(default)]
-        missing_manifest: bool,
-        manifest: Option<String>,
-        expected_status: String,
-        expected_codes: Vec<String>,
-        expected_paths: Vec<String>,
-    }
-
-    #[test]
-    fn deploy_review_matches_control_plane_fixture_matrix() {
-        let cases: Vec<DeployReviewFixture> = serde_yaml::from_str(include_str!(
-            "../tests/fixtures/map-deploy-review-contract/cases.yml"
-        ))
-        .expect("fixture matrix parses");
-
-        for case in cases {
-            let manifest = if case.missing_manifest {
-                None
-            } else {
-                Some(
-                    case.manifest
-                        .as_deref()
-                        .expect("non-missing fixture has manifest"),
-                )
-            };
-            let review = map_deploy_review_contract::review_manifest(manifest, "mithran.yaml");
-
-            assert_eq!(
-                review.status.as_str(),
-                case.expected_status,
-                "case {} status",
-                case.name
-            );
-            assert_eq!(
-                review.finding_codes, case.expected_codes,
-                "case {} finding codes",
-                case.name
-            );
-            let finding_paths = review
-                .findings
-                .iter()
-                .map(|finding| finding.path.clone())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                finding_paths, case.expected_paths,
-                "case {} finding paths",
-                case.name
-            );
-        }
-    }
-
-    #[test]
     fn root_help_hides_setup_command() {
         let mut command = Cli::command();
         let help = command.render_help().to_string();
@@ -2693,7 +2509,6 @@ identity: {project_ref: owner/repo}
             &["login", "print-token"][..],
             &["doctor"][..],
             &["init"][..],
-            &["deploy-review"][..],
             &["validate"][..],
             &["deploy"][..],
             &["onboard"][..],
