@@ -41,7 +41,7 @@ CLI entrypoint and command model:
   arguments, and all command handlers.
 - `Cli` defines global `--login-state`, `--endpoint`, `--token`, and `--json`.
 - `Command` defines `login`, `whoami`, `doctor`, `init`, `validate`,
-  `deploy`/`deploy-request`, `onboard`, `setup`, `access`, `versions`,
+  `deploy`/`deploy-request`, `onboard`, `access`, `versions`,
   `publish`, `canary`, `status`, `watch`, `logs`, `evidence`, `rollback`, and
   `version`.
 
@@ -86,7 +86,6 @@ Onboarding and BYO-CI:
 - `set_repo_variables` writes non-secret `MAP_*` GitHub Actions Variables for
   BYO-CI when a GitHub token is available. It reports failures in JSON and does
   not fail onboarding.
-- `setup` is a deprecated scaffold-only shim for the BYO-CI workflow.
 
 Access, publish, and canary:
 

@@ -56,7 +56,8 @@ enum Command {
     /// Onboard a repo: one authenticated control-plane `/onboard` call (records the source
     /// registry binding — P2a/P2b) + local manifest scaffold; custom CI is opt-in.
     Onboard(OnboardArgs),
-    /// DEPRECATED: use `map onboard`. Compatibility scaffold shim only.
+    /// Compatibility command: use `map onboard`.
+    #[command(hide = true)]
     Setup(SetupArgs),
     /// ADR-0019 (app access & sharing): declare who can reach a protected app as code in
     /// `access.yaml`, then reconcile it into the control-plane. `apply` takes effect hot
@@ -190,7 +191,6 @@ struct DoctorArgs {
     app: Option<String>,
 }
 
-/// Deprecated setup command: use `map onboard`.
 #[derive(Args)]
 struct SetupArgs {
     /// Repository to onboard, `owner/repo`.
@@ -213,7 +213,7 @@ struct SetupArgs {
 /// control-plane `/onboard` endpoint (records the source-registry binding — P2a/P2b) plus a
 /// local `mithran.yaml` scaffold. Webhook-native by default (no repo workflow — the App
 /// installation is the deploy trigger); `--with-ci-workflow` opts into the BYO-CI OIDC deploy
-/// workflow (ADR-0023). Replaces the legacy setup command's host-step printing.
+/// workflow (ADR-0023).
 #[derive(Args)]
 struct OnboardArgs {
     /// Repository to onboard, `owner/repo`.
@@ -828,8 +828,7 @@ fn validate_repo_slug(repo: &str) -> Result<(), String> {
 /// `map onboard <owner/repo>` (P3a). One authenticated call to the control-plane `/onboard`
 /// endpoint records the source-registry binding (P2a/P2b) — so the repo passes the source
 /// broker allowlist with no restart — then scaffolds a starter manifest into `--repo-dir`.
-/// With `--with-ci-workflow`, it also scaffolds the opt-in custom-CI workflow. Supersedes the
-/// legacy setup command's host-step printing.
+/// With `--with-ci-workflow`, it also scaffolds the opt-in custom-CI workflow.
 ///
 /// Scope: registry binding + scaffold. Auto-resolving the installation from the caller's
 /// identity + App grant is P3b (mithran-control-plane#79).
@@ -1170,42 +1169,23 @@ fn scaffold_manifest(repo_dir: Option<&PathBuf>, name: &str) -> Result<Option<Pa
     Ok(Some(path))
 }
 
-/// DEPRECATED setup command: use `map onboard`. Kept as a local scaffold-only shim — it writes
-/// the deploy workflow but does NOT call the control-plane (it cannot supply the installation
-/// ref) and no longer prints the host onboarding wall (superseded by the `/onboard` endpoint).
 fn setup(cli: &Cli, args: &SetupArgs) -> Result<(), String> {
     validate_repo_slug(&args.repo)?;
-    eprintln!(
-        "map: the setup command is deprecated; use `map onboard <owner/repo> --installation-ref <ref>`."
-    );
-    // Webhook-native default: scaffold nothing unless the BYO-CI opt-in is requested.
-    let workflow_path = if args.with_ci_workflow {
-        scaffold_deploy_workflow(args.repo_dir.as_ref(), &args.workflow)?
-    } else {
-        None
-    };
+    let guidance = setup_guidance(&args.repo);
     print_json_or_text(
         cli.json,
         json!({
             "ok": true,
             "schema_version": "map.setup.v1",
-            "deprecated": "use `map onboard`",
             "repo": args.repo,
-            "workflow_written": workflow_path.as_ref().map(|p| p.display().to_string()),
+            "next": guidance,
         }),
-        &match &workflow_path {
-            Some(path) => format!(
-                "wrote {} ({}). Deprecated: run `map onboard {} --installation-ref <ref>` to record the registry binding.",
-                path.display(),
-                args.workflow,
-                args.repo
-            ),
-            None => format!(
-                "(no --repo-dir; nothing written). Deprecated: use `map onboard {} --installation-ref <ref>`.",
-                args.repo
-            ),
-        },
+        &guidance,
     )
+}
+
+fn setup_guidance(repo: &str) -> String {
+    format!("Use `map onboard {repo} --installation-ref <ref>`.")
 }
 
 // ───────────────────────── map versions / map publish (ADR-0018 #63) ─────────────────────────
@@ -1999,6 +1979,7 @@ fn emit_doctor(cli: &Cli, checks: &[Check]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     fn access_args_for(file: &PathBuf) -> AccessApplyArgs {
         AccessApplyArgs {
@@ -2178,7 +2159,16 @@ mod tests {
     }
 
     #[test]
-    fn setup_parses_repo_and_repo_dir() {
+    fn root_help_hides_setup_command() {
+        let mut command = Cli::command();
+        let help = command.render_help().to_string();
+
+        assert!(help.contains("onboard"));
+        assert!(!help.contains("setup"));
+    }
+
+    #[test]
+    fn setup_remains_callable_for_concise_guidance() {
         let cli = Cli::try_parse_from(["map", "setup", "mithran-hq/demo", "--repo-dir", "/tmp/x"])
             .expect("parses");
         match cli.command {
@@ -2189,6 +2179,13 @@ mod tests {
             }
             _ => panic!("expected setup"),
         }
+
+        let guidance = setup_guidance("mithran-hq/demo");
+        assert_eq!(
+            guidance,
+            "Use `map onboard mithran-hq/demo --installation-ref <ref>`."
+        );
+        assert!(!guidance.to_lowercase().contains("deprecated"));
     }
 
     #[test]
