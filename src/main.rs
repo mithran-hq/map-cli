@@ -24,17 +24,25 @@ const DEFAULT_STARTER_RUNTIME: &str = "nodejs22";
 const DEFAULT_STARTER_COMMAND: &str = "npm start";
 
 #[derive(Parser)]
-#[command(name = "map", version, about = "Thin MAP client for Aegis.app")]
+#[command(
+    name = "map",
+    version,
+    about = "Deploy, inspect, publish, and manage Forge apps"
+)]
 struct Cli {
+    /// Path to a saved map login state file.
     #[arg(long, global = true)]
     login_state: Option<PathBuf>,
 
+    /// Override the Forge control-plane endpoint for this command.
     #[arg(long, global = true)]
     endpoint: Option<String>,
 
+    /// Bearer token for this command. Prefer saved login state for interactive use.
     #[arg(long, global = true)]
     token: Option<String>,
 
+    /// Print structured JSON when the command supports it.
     #[arg(long, global = true)]
     json: bool,
 
@@ -44,40 +52,43 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Save or print local Forge login state.
     Login(LoginCommand),
+    /// Show the saved Forge account and endpoint.
     Whoami,
+    /// Check control-plane readiness and optional app diagnostics.
     Doctor(DoctorArgs),
+    /// Write a starter mithran.yaml manifest.
     Init(InitArgs),
+    /// Validate a deploy request without deploying.
     Validate(DeployTarget),
-    /// ADR-0016 (amended 2026-07-06 → webhook-native): POST the deploy request straight to the
-    /// control-plane `/v1/map-control/deploy/request` using the saved `map-control` login token.
-    /// GitHub is not in the trigger path; the server-side review gate is unchanged. The
-    /// `deploy-request` alias is the explicit host/runner-side spelling of the same call.
+    /// Request a deploy directly. Built-in GitHub App webhooks are preferred for standard refs.
     #[command(alias = "deploy-request")]
     Deploy(DeployRequestArgs),
-    /// Onboard a repo: one authenticated control-plane `/onboard` call (records the source
-    /// registry binding — P2a/P2b) + local manifest scaffold; custom CI is opt-in.
+    /// Register a GitHub repo with Forge and optionally scaffold local files.
     Onboard(OnboardArgs),
     /// Compatibility command: use `map onboard`.
     #[command(hide = true)]
     Setup(SetupArgs),
-    /// ADR-0019 (app access & sharing): declare who can reach a protected app as code in
-    /// `access.yaml`, then reconcile it into the control-plane. `apply` takes effect hot
-    /// (next deploy route push); `plan` prints the resolved policy without applying.
+    /// Plan or apply protected app sharing from access.yaml.
     Access(AccessArgs),
-    /// ADR-0018 (#63): list an app's addressable internal versions, its aliases, and which
-    /// internal version is currently published to the clean public URL.
+    /// List internal versions, app-environment aliases, and the published clean URL.
     Versions(VersionsArgs),
-    /// ADR-0018 (#63): publish a reviewed, succeeded internal version to the app's clean
-    /// public URL (review-gated + stale-safe; pins the external published pointer).
+    /// Publish a reviewed version to the app's clean public URL.
     Publish(PublishArgs),
-    /// Start, promote, or rollback a weighted Forge canary on the production alias.
+    /// Start, promote, or roll back a weighted canary.
     Canary(CanaryArgs),
+    /// Show deploy status for a deployment ref.
     Status(IdArgs),
+    /// Poll deploy status until success, failure, or timeout.
     Watch(WatchArgs),
+    /// Explain where to inspect deploy status and evidence.
     Logs(IdArgs),
+    /// Show deploy evidence for a deployment ref.
     Evidence(IdArgs),
+    /// Roll back the route pointer for a deployment ref.
     Rollback(RollbackArgs),
+    /// Print the map CLI version.
     Version,
 }
 
@@ -89,77 +100,89 @@ struct LoginCommand {
 
 #[derive(Subcommand)]
 enum LoginSubcommand {
+    /// Save control-plane endpoint and token metadata locally.
     Save(LoginSaveArgs),
+    /// Print the saved token for an allowed audience.
     PrintToken(PrintTokenArgs),
 }
 
 #[derive(Args)]
 struct LoginSaveArgs {
+    /// Forge control-plane endpoint to save.
     #[arg(long)]
     map_control_endpoint: String,
 
+    /// Optional secondary controller endpoint to save.
     #[arg(long)]
     jason_controller_endpoint: Option<String>,
 
+    /// Bearer token to save in the login state file.
     #[arg(long)]
     access_token: String,
 
+    /// Audience this login state is valid for.
     #[arg(long, default_value = "map-control")]
     audience: String,
 
+    /// Allowed token scopes, comma-separated or repeated.
     #[arg(long = "scope", value_delimiter = ',')]
     scopes: Vec<String>,
 
+    /// Token expiry timestamp, when known.
     #[arg(long)]
     expires_at: Option<String>,
 
+    /// Principal email to record in login state.
     #[arg(long)]
     email: Option<String>,
 
+    /// Principal display name to record in login state.
     #[arg(long)]
     name: Option<String>,
 }
 
 #[derive(Args)]
 struct PrintTokenArgs {
+    /// Audience to print a token for.
     #[arg(long)]
     audience: String,
 }
 
 #[derive(Args, Serialize)]
 struct InitArgs {
+    /// Manifest path to create.
     #[arg(long, default_value = "mithran.yaml")]
     manifest: PathBuf,
 }
 
 #[derive(Args, Serialize)]
 struct DeployTarget {
+    /// GitHub repository, either owner/repo or github://owner/repo.
     #[arg(long)]
     repo: String,
 
+    /// App environment to target, such as preview or production.
     #[arg(long)]
     env: Option<String>,
 
+    /// Git ref to deploy, such as refs/heads/release/v1.
     #[arg(long = "ref", conflicts_with = "sha")]
     ref_name: Option<String>,
 
+    /// Exact 40-character Git SHA to deploy.
     #[arg(long)]
     sha: Option<String>,
 }
 
-/// `map deploy` (ADR-0016, amended 2026-07-06 → webhook-native): POST straight to the
-/// control-plane `/v1/map-control/deploy/request` using the saved `map-control` login token —
-/// no GitHub Actions workflow in the trigger path. Reachable wherever the control-plane
-/// endpoint is (the public authenticated edge, or host-local :4260 / a tunnel). `--repo`
-/// accepts a bare `owner/repo` (normalized to `github://owner/repo`) or a full ref. The
-/// `deploy-request` alias is the explicit host/runner-side spelling of the same call.
+/// Request a deploy directly for a repo ref or SHA. Use the built-in GitHub App
+/// webhook path for standard main and release refs unless automation needs an
+/// explicit deploy request.
 #[derive(Args, Serialize)]
 struct DeployRequestArgs {
     #[command(flatten)]
     target: DeployTarget,
 
-    /// GitHub App installation ref. REQUIRED for a real (non-smoke) deploy — the source
-    /// broker rejects a missing/unknown installation_ref at source-resolve.
+    /// GitHub App installation ref authorizing source fetch for this repo.
     #[arg(long)]
     installation_ref: Option<String>,
 
@@ -167,13 +190,15 @@ struct DeployRequestArgs {
     #[arg(long)]
     app_ref: Option<String>,
 
+    /// Tenant ref to attach to the deploy request.
     #[arg(long)]
     tenant_ref: Option<String>,
 
+    /// Account ref to attach to the deploy request.
     #[arg(long)]
     account_ref: Option<String>,
 
-    /// Platform env, e.g. `production`.
+    /// Control-plane environment value for the request. This is separate from `--env`.
     #[arg(long)]
     platform_env: Option<String>,
 
@@ -181,11 +206,12 @@ struct DeployRequestArgs {
     #[arg(long)]
     deployment_ref: Option<String>,
 
+    /// Evidence ref to attach to the deploy request.
     #[arg(long)]
     evidence_ref: Option<String>,
 }
 
-/// `map doctor` (map-cli#6): readiness checks against the saved `map-control` endpoint.
+/// Run readiness checks against the saved Forge control-plane endpoint.
 #[derive(Args)]
 struct DoctorArgs {
     /// Also diagnose a specific app `owner/repo` (source access + alias/recent deployment).
@@ -206,23 +232,19 @@ struct SetupArgs {
     #[arg(long, default_value = "map-deploy.yml")]
     workflow: String,
 
-    /// Opt in to scaffolding the BYO-CI deploy workflow (off by default; see `map onboard`).
+    /// Also scaffold the optional custom-CI deploy workflow.
     #[arg(long, default_value_t = false)]
     with_ci_workflow: bool,
 }
 
-/// `map onboard <owner/repo>` (P3a, mithran-business#531): one authenticated call to the
-/// control-plane `/onboard` endpoint (records the source-registry binding — P2a/P2b) plus a
-/// local `mithran.yaml` scaffold. Webhook-native by default (no repo workflow — the App
-/// installation is the deploy trigger); `--with-ci-workflow` opts into the BYO-CI OIDC deploy
-/// workflow (ADR-0023).
+/// Register a GitHub repo with Forge. The default path uses GitHub App webhooks
+/// and does not write a repo workflow.
 #[derive(Args)]
 struct OnboardArgs {
     /// Repository to onboard, `owner/repo`.
     repo: String,
 
     /// GitHub App installation ref authorizing the repo, e.g. `github-installation://131136661`.
-    /// (Auto-resolution from the caller's identity + App grant is P3b.)
     #[arg(long)]
     installation_ref: String,
 
@@ -248,9 +270,7 @@ struct OnboardArgs {
     #[arg(long, default_value = "map-deploy.yml")]
     workflow: String,
 
-    /// Opt in to the BYO-CI path (ADR-0023): also scaffold the keyless-OIDC deploy workflow and
-    /// set the `MAP_*` repo Variables it reads. Off by default — the webhook (App installation)
-    /// is the deploy trigger and needs no repo workflow (ADR-0016 amendment, webhook-native).
+    /// Also scaffold the optional custom-CI deploy workflow and its repo Variables.
     #[arg(long, default_value_t = false)]
     with_ci_workflow: bool,
 }
@@ -263,8 +283,7 @@ struct AccessArgs {
 
 #[derive(Subcommand)]
 enum AccessSubcommand {
-    /// Reconcile the app's `access.yaml` into the control-plane (hot — enforced on the next
-    /// deploy route push, no rollout).
+    /// Apply the resolved access policy to Forge.
     Apply(AccessApplyArgs),
     /// Print the resolved access policy without applying it (no control-plane call).
     Plan(AccessApplyArgs),
@@ -297,18 +316,14 @@ struct AccessApplyArgs {
     exposure: Option<String>,
 }
 
-/// `map versions <app>` (ADR-0018 / #63 Phase 2c): list an app's per-version pointers,
-/// its aliases (production/preview/release), and which internal version the clean public
-/// URL is currently published to. Read-only — GET `/v1/map-control/routes/status`.
+/// List an app's internal versions, app-environment aliases, and published URL.
 #[derive(Args)]
 struct VersionsArgs {
     /// App name (e.g. `gtd-tracker`); normalized to `app:<app>`. Accepts a literal `app:` ref.
     app: String,
 }
 
-/// `map publish <app>` (ADR-0018 / #63 Phase 2c): pin the app's external published pointer
-/// (the clean, env-bare public URL) to a chosen healthy internal version. Resolve the version
-/// from `--deployment-ref`, or look one up by `--version <label>` (see `map versions`).
+/// Publish a reviewed internal version to the app's clean public URL.
 #[derive(Args)]
 struct PublishArgs {
     /// App name (e.g. `gtd-tracker`); normalized to `app:<app>`. Accepts a literal `app:` ref.
@@ -333,7 +348,7 @@ struct PublishArgs {
     actor: Option<String>,
 }
 
-/// `map canary …` (ADR-0017): operator controls for a weighted production alias canary.
+/// Operator controls for a weighted app-environment canary.
 #[derive(Args)]
 struct CanaryArgs {
     #[command(subcommand)]
@@ -342,11 +357,11 @@ struct CanaryArgs {
 
 #[derive(Subcommand)]
 enum CanarySubcommand {
-    /// Shift a 1..99% slice of production traffic to a succeeded deployment.
+    /// Shift a 1..99% traffic slice to a succeeded deployment.
     Start(CanaryStartArgs),
     /// Promote the active canary to 100% and clear the split.
     Promote(CanaryEndArgs),
-    /// Drop the active canary split and keep current production at 100%.
+    /// Drop the active canary split and keep the current deployment at 100%.
     Rollback(CanaryEndArgs),
 }
 
@@ -376,24 +391,30 @@ struct CanaryEndArgs {
 
 #[derive(Args)]
 struct IdArgs {
+    /// Deployment ref to inspect.
     id: String,
 }
 
 #[derive(Args)]
 struct WatchArgs {
+    /// Deployment ref to poll.
     id: String,
 
+    /// Seconds between status polls.
     #[arg(long, default_value_t = 5)]
     interval_seconds: u64,
 
+    /// Maximum seconds to wait before failing.
     #[arg(long, default_value_t = 120)]
     timeout_seconds: u64,
 }
 
 #[derive(Args, Serialize)]
 struct RollbackArgs {
+    /// Deployment ref whose route pointer should roll back.
     id: String,
 
+    /// Evidence ref to attach to the rollback request.
     #[arg(long)]
     evidence_ref: Option<String>,
 }
@@ -893,7 +914,7 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
     } else {
         (
             None,
-            json!({ "set": false, "reason": "webhook-native default; pass --with-ci-workflow for the BYO-CI OIDC path" }),
+            json!({ "set": false, "reason": "default path uses the GitHub App; pass --with-ci-workflow to scaffold the optional custom-CI workflow" }),
         )
     };
 
@@ -2364,6 +2385,74 @@ mod tests {
 
         assert!(help.contains("onboard"));
         assert!(!help.contains("setup"));
+    }
+
+    #[test]
+    fn public_help_does_not_leak_internal_planning_terms() {
+        let forbidden = [
+            "ADR-",
+            "mithran-business#",
+            "map-cli#",
+            "P2a",
+            "P2b",
+            "P3a",
+            "P3b",
+            "BYO-CI",
+            "webhook-native",
+            "Aegis.app",
+            "sandbox",
+            "staging",
+        ];
+
+        for path in [
+            &[][..],
+            &["login"][..],
+            &["login", "save"][..],
+            &["login", "print-token"][..],
+            &["doctor"][..],
+            &["init"][..],
+            &["validate"][..],
+            &["deploy"][..],
+            &["onboard"][..],
+            &["access"][..],
+            &["access", "apply"][..],
+            &["access", "plan"][..],
+            &["versions"][..],
+            &["publish"][..],
+            &["canary"][..],
+            &["canary", "start"][..],
+            &["canary", "promote"][..],
+            &["canary", "rollback"][..],
+            &["status"][..],
+            &["watch"][..],
+            &["logs"][..],
+            &["evidence"][..],
+            &["rollback"][..],
+        ] {
+            let mut command = Cli::command();
+            let label = if path.is_empty() {
+                "root".to_string()
+            } else {
+                path.join(" ")
+            };
+            let help = render_help_for_path(&mut command, path);
+            for term in forbidden {
+                assert!(
+                    !help.contains(term),
+                    "{label} help should not contain internal term {term}"
+                );
+            }
+        }
+    }
+
+    fn render_help_for_path(command: &mut clap::Command, path: &[&str]) -> String {
+        let mut current = command;
+        for segment in path {
+            current = current
+                .find_subcommand_mut(segment)
+                .unwrap_or_else(|| panic!("expected {segment} subcommand"));
+        }
+        current.render_help().to_string()
     }
 
     #[test]
