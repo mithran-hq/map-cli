@@ -13,6 +13,8 @@ control-plane routes, auth requirements, and verification evidence in
   allows that audience.
 - Validating deploy target refs and SHAs before requests leave the operator
   machine.
+- Reviewing `mithran.yaml` locally against the public
+  `map-deploy-review-contract` `map.mithran/v1` manifest contract before deploy.
 - Calling MAP control-plane deploy, onboard, access, route, publish, evidence,
   rollback, status, and readiness endpoints.
 - Scaffolding `mithran.yaml` and, only when explicitly requested, the custom-CI
@@ -33,8 +35,8 @@ CLI entrypoint and command model:
 - `src/main.rs` defines the `map` binary, global flags, subcommands, command
   arguments, and all command handlers.
 - `Cli` defines global `--login-state`, `--endpoint`, `--token`, and `--json`.
-- `Command` defines `login`, `whoami`, `doctor`, `init`, `validate`,
-  `deploy`/`deploy-request`, `onboard`, `access`, `versions`,
+- `Command` defines `login`, `whoami`, `doctor`, `init`, `deploy-review`,
+  `validate`, `deploy`/`deploy-request`, `onboard`, `access`, `versions`,
   `publish`, `canary`, `status`, `watch`, `logs`, `evidence`, `rollback`, and
   `version`.
 
@@ -55,6 +57,12 @@ Auth and local state:
 
 Deploy and status flow:
 
+- `deploy_review` reads `--manifest` under `--repo-root` and calls the public
+  `map-deploy-review-contract` crate. Missing manifests are reported through
+  the same contract as `ERR_MANIFEST_MISSING`; unreadable files are local CLI
+  errors. `--json` prints the contract response. Text output prints a short
+  pass message or hard blocking `ERR_*` findings. This command makes no
+  control-plane call and mutates no deploy, route, or evidence state.
 - `deploy_request` validates `--ref` or `--sha`, normalizes a bare
   `owner/repo` to `github://owner/repo`, then POSTs
   `/v1/map-control/deploy/request`.
@@ -123,6 +131,7 @@ Packaging and release:
 | Command | Method and route |
 | --- | --- |
 | `map doctor` | `GET /v1/map-control/config`, `GET /v1/map-control/routes/status` |
+| `map deploy-review` | No HTTP call |
 | `map deploy`, `map deploy-request` | `POST /v1/map-control/deploy/request` |
 | `map onboard` | `POST /v1/map-control/onboard` |
 | `map access apply` | `POST /v1/map-control/access` |
@@ -180,6 +189,8 @@ map onboard mithran-hq/demo \
 Trigger a direct deploy request:
 
 ```bash
+map deploy-review --repo-root ./demo
+
 map deploy \
   --repo mithran-hq/demo \
   --env production \
@@ -227,6 +238,10 @@ python3 scripts/package_component.py target/map-cli-component.tar.gz
 Focused evidence:
 
 ```bash
+tmpdir=$(mktemp -d)
+cargo run -- init --manifest "$tmpdir/mithran.yaml"
+cargo run -- deploy-review --repo-root "$tmpdir"
+cargo run -- --json deploy-review --repo-root "$tmpdir"
 cargo run -- version
 cargo run -- validate --repo mithran-hq/demo --sha 0123456789abcdef0123456789abcdef01234567
 cargo run -- login save \
