@@ -2531,6 +2531,13 @@ mod tests {
         ));
         assert!(MAP_DEPLOY_WORKFLOW_TEMPLATE.contains("production repository variable is required"));
         for forbidden in [
+            "ADR-",
+            "mithran-control-plane",
+            "Envoy",
+            "ext_authz",
+            "Keep it in sync",
+            "clean-room runbook",
+            "NO LLM",
             "map setup",
             "sandbox",
             "staging",

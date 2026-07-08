@@ -1,24 +1,17 @@
-# map-deploy.yml — opt-in MAP custom-CI deploy trigger.
+# map-deploy.yml - optional MAP custom-CI deploy trigger.
 #
-# Deploys fire from THREE triggers only — NO deploy-on-every-push:
-#   • push/merge to a release branch (release/**) → production deploy of that SHA
-#   • a release tag (vX.Y.Z, semver)              → production deploy of that SHA
-#   • manual GitHub Actions workflow_dispatch     → selected app env + ref
-# GitHub Actions is the trigger + audit/status surface ONLY. No LLM / build / heavy
-# work runs here — the deploy-review gate stays server-side in mithran-control-plane.
-# This workflow POSTs the deploy request to the control-plane chokepoint
-# `/v1/map-control/deploy/request`; the state machine reviews-before-build as usual.
+# Deploys fire from these triggers only:
+# - push or merge to a release branch (release/**): production deploy of that SHA
+# - a release tag (vX.Y.Z, semver): production deploy of that SHA
+# - manual workflow_dispatch: selected app environment and ref
 #
-# `map onboard <owner/repo> --repo-dir <checkout> --with-ci-workflow` drops this file
-# into a repo at `.github/workflows/map-deploy.yml`. Keep it in sync with
-# map-cli/templates/map-deploy.yml.
+# `map onboard <owner/repo> --repo-dir <checkout> --with-ci-workflow` writes this
+# file into `.github/workflows/map-deploy.yml`.
 #
-# AUTH (ADR-0023, keyless): the workflow authenticates to the PUBLIC control-plane edge
-# via GitHub OIDC federation — NO stored deploy secret. It requests a GitHub Actions OIDC
-# token (audience = map-control) and exchanges it at mithran-auth for a short-lived
-# map-control token, which the Envoy edge ext_authz validates. mithran-auth mints only for
-# a repo with an ACTIVE onboarding binding (so `map onboard` must have run). Runs on a
-# GitHub-hosted runner against the public authenticated edge.
+# Auth uses GitHub OIDC, not a stored deploy secret. This workflow requests a
+# GitHub Actions OIDC token, exchanges it for a short-lived MAP token, then POSTs
+# a deploy request to `/v1/map-control/deploy/request`. The repository must be
+# onboarded before the token exchange can succeed.
 
 name: map-deploy
 
@@ -46,7 +39,7 @@ on:
 
 permissions:
   contents: read
-  # ADR-0023: required to mint the GitHub Actions OIDC token exchanged for a map-control token.
+  # Required for the GitHub Actions OIDC token exchange.
   id-token: write
 
 jobs:
@@ -87,9 +80,8 @@ jobs:
             exit 1
           fi
 
-          # Trigger-aware. A release-branch / tag PUSH deploys the pushed SHA to
-          # production; manual dispatch uses the operator's env + ref. Nothing else
-          # reaches this workflow (see the `on:` filter) — no deploy-on-every-push.
+          # Release branch and tag pushes deploy the pushed SHA to production.
+          # Manual dispatch uses the operator-selected environment and ref.
           case "${GITHUB_EVENT_NAME}" in
             push)
               requested_ref="${GITHUB_SHA}"
@@ -102,8 +94,8 @@ jobs:
           esac
           deployment_ref="deployment://${platform_env}/${app_env}/${repo##*/}-${GITHUB_RUN_ID}"
 
-          # ADR-0023 keyless auth: GitHub OIDC token (aud=map-control) → mithran-auth exchange
-          # → short-lived map-control token. id-token:write (above) provides the request creds.
+          # Exchange the GitHub OIDC token for a short-lived MAP token.
+          # `id-token: write` above provides the request credentials.
           if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
             echo "::error::no GitHub OIDC request credentials — ensure 'permissions: id-token: write'." >&2
             exit 1
@@ -130,8 +122,8 @@ jobs:
             exit 1
           fi
 
-          # The source broker rejects requested_ref containing secret/token/etc.;
-          # for such branches pass the 40-hex SHA as the ref (see clean-room runbook §3).
+          # If a branch name is rejected by ref policy, rerun with the
+          # 40-character commit SHA as the ref.
           source_sha=""
           if printf '%s' "${requested_ref}" | grep -Eq '^[0-9a-f]{40}$'; then
             source_sha="${requested_ref}"
