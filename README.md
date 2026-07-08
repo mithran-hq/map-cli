@@ -28,6 +28,9 @@ map onboard mithran-hq/demo --installation-ref github-installation://131136661 \
 # Diagnose readiness against the saved control-plane endpoint.
 map doctor --app mithran-hq/demo
 
+# Review mithran.yaml locally before deploy.
+map deploy-review --repo-root ./demo
+
 # Trigger a direct deploy request. Standard GitHub refs should usually deploy
 # through the GitHub App webhook path after onboarding.
 map deploy --repo mithran-hq/demo --env production --ref refs/heads/release/1.2 \
@@ -64,6 +67,10 @@ per-repo deploy secret.
   authenticated control-plane endpoint. No GitHub Actions workflow is dispatched.
 - `map onboard <owner/repo> --installation-ref <ref>` records the source-registry binding and
   scaffolds a starter `mithran.yaml`. It writes **no** repo workflow by default.
+- `map deploy-review [--repo-root .] [--manifest mithran.yaml]` reviews the app manifest locally
+  before deploy. It uses the control-plane-owned `map.mithran/v1` contract and emits hard blocking
+  `ERR_*` findings; it does not upload source, create deployment state, mutate routes, or mint
+  evidence.
 - **Opt-in custom CI:** pass `--with-ci-workflow` to `map onboard` to also scaffold
   the keyless-OIDC `.github/workflows/map-deploy.yml` (`curl` → OIDC token exchange →
   `/deploy/request`). This is for repos that intentionally trigger deploys from GitHub Actions;
