@@ -971,7 +971,7 @@ fn onboard_output(
         "next": next,
     });
     let text = format!(
-        "onboarded {repo} (registry binding recorded).\napp identity: {project_ref} (stored as identity.project_ref; used for deploy routing, versions, and publish).{}{}\nnext: {next}.",
+        "onboarded {repo} (repo registration recorded).\napp identity: {project_ref} (stored as identity.project_ref; used for deploy routing, versions, and publish).{}{}\nnext: {next}.",
         workflow_path
             .map(|p| format!("\nwrote {}", p.display()))
             .unwrap_or_default(),
@@ -2541,6 +2541,8 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("deploy routing"));
+        assert!(text.contains("repo registration recorded"), "got: {text}");
+        assert!(!text.contains("registry binding"), "got: {text}");
         assert!(text.contains("app identity: app:my-app"), "got: {text}");
         assert!(text.contains("identity.project_ref"), "got: {text}");
         assert!(text.contains("deploy routing"), "got: {text}");
