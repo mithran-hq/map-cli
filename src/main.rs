@@ -514,7 +514,7 @@ fn run(cli: Cli) -> Result<(), String> {
         ),
         Command::Watch(args) => watch(&cli, args),
         Command::Logs(_) => Err(
-            "the live control plane exposes no deploy logs route; use `map status` or `map evidence`"
+            "deployment logs are not available yet; use `map --json status <deployment-ref>` for deployment state or `map --json evidence <deployment-ref>` for review evidence"
                 .to_string(),
         ),
         Command::Evidence(args) => get(
@@ -2659,6 +2659,27 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), body);
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn logs_unsupported_error_points_to_supported_investigation_commands() {
+        let err = run(Cli {
+            login_state: None,
+            endpoint: None,
+            token: None,
+            json: false,
+            command: Command::Logs(IdArgs {
+                id: "deployment://sandbox/production/demo-1".to_string(),
+            }),
+        })
+        .unwrap_err();
+
+        assert!(err.contains("map --json status <deployment-ref>"));
+        assert!(err.contains("map --json evidence <deployment-ref>"));
+        assert!(!err.contains("control plane"));
+        assert!(!err.contains("control-plane"));
+        assert!(!err.contains("route"));
+        assert!(!err.contains("server"));
     }
 
     #[test]
