@@ -188,7 +188,7 @@ struct DeployRequestArgs {
 /// `map doctor` (map-cli#6): readiness checks against the saved `map-control` endpoint.
 #[derive(Args)]
 struct DoctorArgs {
-    /// Also diagnose a specific app `owner/repo` (allowlist + alias/recent deployment).
+    /// Also diagnose a specific app `owner/repo` (source access + alias/recent deployment).
     #[arg(long)]
     app: Option<String>,
 }
@@ -2006,21 +2006,21 @@ fn allowlist_count(config: &Value) -> Option<u64> {
 fn allowlist_check(config: &Value) -> Check {
     match allowlist_count(config) {
         Some(0) => Check::fail(
-            "source allowlist",
-            "0 repositories allowlisted",
+            "source access",
+            "0 repositories registered for source access",
             "onboard a repo with `map onboard <owner/repo> --installation-ref <ref>`",
         ),
         Some(count) => Check::ok(
-            "source allowlist",
+            "source access",
             format!(
-                "{count} repositor{} allowlisted",
+                "{count} repositor{} registered for source access",
                 if count == 1 { "y" } else { "ies" }
             ),
         ),
         None => Check::warn(
-            "source allowlist",
-            "allowed_repository_count missing from config",
-            "control-plane config did not report the broker allowlist; check the service version",
+            "source access",
+            "source-access repository count missing from config",
+            "control-plane config did not report source-access registration count; check the service version",
         ),
     }
 }
@@ -2031,19 +2031,19 @@ fn allowlist_check(config: &Value) -> Check {
 fn app_allowlist_check(allowlist_count: Option<u64>, has_deployment: bool, app: &str) -> Check {
     if has_deployment {
         return Check::ok(
-            "app allowlisted",
-            format!("{app} has a recorded deployment (implies it was allowlisted)"),
+            "app source access",
+            format!("{app} has a recorded deployment (confirms source access was available)"),
         );
     }
     match allowlist_count {
         Some(0) => Check::fail(
-            "app allowlisted",
-            format!("no repositories allowlisted — {app} cannot deploy"),
+            "app source access",
+            format!("no repositories registered for source access — {app} cannot deploy"),
             format!("run `map onboard {app} --installation-ref <ref>`"),
         ),
         _ => Check::warn(
-            "app allowlisted",
-            format!("cannot confirm {app} is allowlisted (the config endpoint exposes only a count, not the list)"),
+            "app source access",
+            format!("cannot confirm source access for {app} (the config endpoint exposes only a count, not the registered repo list)"),
             format!("run `map onboard {app} --installation-ref <ref>`; doctor counts registry bindings (P2a) so an onboarded repo shows here"),
         ),
     }
@@ -2789,11 +2789,11 @@ mod tests {
         let ok = format_check(&Check::ok("control-plane reachable", "200"));
         assert_eq!(ok, "[  ok] control-plane reachable — 200");
         let fail = format_check(&Check::fail(
-            "source allowlist",
+            "source access",
             "0 repositories",
             "run `map onboard <owner/repo> --installation-ref <ref>`",
         ));
-        assert!(fail.starts_with("[fail] source allowlist — 0 repositories"));
+        assert!(fail.starts_with("[fail] source access — 0 repositories"));
         assert!(fail.contains("↳ run `map onboard <owner/repo> --installation-ref <ref>`"));
     }
 
@@ -2819,32 +2819,50 @@ mod tests {
                 }
             })
         };
-        assert_eq!(allowlist_check(&config(0)).level, Level::Fail);
+        let zero = allowlist_check(&config(0));
+        assert_eq!(zero.level, Level::Fail);
+        assert_eq!(zero.name, "source access");
+        assert_eq!(zero.detail, "0 repositories registered for source access");
         let one = allowlist_check(&config(1));
         assert_eq!(one.level, Level::Ok);
-        assert!(one.detail.contains("1 repository"));
+        assert_eq!(one.detail, "1 repository registered for source access");
         let two = allowlist_check(&config(2));
         assert_eq!(two.level, Level::Ok);
-        assert!(two.detail.contains("2 repositories"));
-        assert_eq!(allowlist_check(&json!({})).level, Level::Warn);
+        assert_eq!(two.detail, "2 repositories registered for source access");
+        let missing = allowlist_check(&json!({}));
+        assert_eq!(missing.level, Level::Warn);
+        assert_eq!(missing.name, "source access");
+        assert_eq!(
+            missing.detail,
+            "source-access repository count missing from config"
+        );
     }
 
     #[test]
     fn app_checks_use_deployment_and_alias_signals() {
         // A recorded deployment implies allowlisted, even though config exposes only a count.
+        let deployed = app_allowlist_check(Some(2), true, "mithran-hq/demo");
+        assert_eq!(deployed.level, Level::Ok);
+        assert_eq!(deployed.name, "app source access");
         assert_eq!(
-            app_allowlist_check(Some(2), true, "mithran-hq/demo").level,
-            Level::Ok
+            deployed.detail,
+            "mithran-hq/demo has a recorded deployment (confirms source access was available)"
         );
         // No deployment + nothing allowlisted is a hard fail.
+        let no_access = app_allowlist_check(Some(0), false, "mithran-hq/demo");
+        assert_eq!(no_access.level, Level::Fail);
+        assert_eq!(no_access.name, "app source access");
         assert_eq!(
-            app_allowlist_check(Some(0), false, "mithran-hq/demo").level,
-            Level::Fail
+            no_access.detail,
+            "no repositories registered for source access — mithran-hq/demo cannot deploy"
         );
         // Allowlisted-count > 0 but no deployment for this repo: can't confirm → warn.
+        let unconfirmed = app_allowlist_check(Some(2), false, "mithran-hq/demo");
+        assert_eq!(unconfirmed.level, Level::Warn);
+        assert_eq!(unconfirmed.name, "app source access");
         assert_eq!(
-            app_allowlist_check(Some(2), false, "mithran-hq/demo").level,
-            Level::Warn
+            unconfirmed.detail,
+            "cannot confirm source access for mithran-hq/demo (the config endpoint exposes only a count, not the registered repo list)"
         );
         assert_eq!(
             app_route_check(true, true, "mithran-hq/demo").level,
