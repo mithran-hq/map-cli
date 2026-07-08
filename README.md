@@ -32,6 +32,10 @@ map versions demo
 
 # Publish a reviewed, succeeded internal version to the app's clean public URL.
 map publish demo --version demo-2
+
+# Start, promote, or rollback a Forge canary on the production alias.
+map canary start demo --deployment-ref deployment://sandbox/production/demo-3 --weight 20
+map canary promote demo --deployment-ref deployment://sandbox/production/demo-3
 ```
 
 Jason can reuse the MAP login by asking for a controller token:
@@ -78,6 +82,20 @@ without changing what end-users see.
   control-plane is **review-gated** (rejects unless the version is a reviewed, succeeded
   deploy) and **stale-safe** (with `--expected-sha`, rejects if the version's recorded source
   SHA moved). On success it prints the published URL.
+
+## Canary model (ADR-0017)
+
+Canary operations mutate the app's production alias through the control-plane canary endpoint:
+
+- `map canary start <app> --deployment-ref <ref> --weight <1-99>` validates the weight locally,
+  then POSTs `/v1/map-control/deploy/canary` with action `start`, the canary deployment ref, and
+  `weight_pct`. The control-plane requires the target deployment to be succeeded or promoted.
+- `map canary promote <app> --deployment-ref <ref>` POSTs the same endpoint with action
+  `promote`, moving the active canary to current at 100% and clearing the split.
+- `map canary rollback <app> --deployment-ref <ref>` POSTs action `rollback`, clearing the split
+  and keeping current production at 100%.
+- Text output reports the action, app, canary deployment ref, alias/hostname when returned, and
+  result. `--json` prints the server response unchanged.
 
 `map domain` (custom-domain binding) is a separate, later slice and is not part of this CLI yet.
 

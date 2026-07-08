@@ -18,6 +18,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAP_DEPLOY_WORKFLOW_TEMPLATE: &str = include_str!("../templates/map-deploy.yml");
 
 const USER_AGENT: &str = concat!("map-cli/", env!("CARGO_PKG_VERSION"));
+const CANARY_DEPLOY_PATH: &str = "/v1/map-control/deploy/canary";
 
 #[derive(Parser)]
 #[command(name = "map", version, about = "Thin MAP client for Aegis.app")]
@@ -66,6 +67,8 @@ enum Command {
     /// ADR-0018 (#63): publish a reviewed, succeeded internal version to the app's clean
     /// public URL (review-gated + stale-safe; pins the external published pointer).
     Publish(PublishArgs),
+    /// Start, promote, or rollback a weighted Forge canary on the production alias.
+    Canary(CanaryArgs),
     Status(IdArgs),
     Watch(WatchArgs),
     Logs(IdArgs),
@@ -326,6 +329,47 @@ struct PublishArgs {
     actor: Option<String>,
 }
 
+/// `map canary …` (ADR-0017): operator controls for a weighted production alias canary.
+#[derive(Args)]
+struct CanaryArgs {
+    #[command(subcommand)]
+    command: CanarySubcommand,
+}
+
+#[derive(Subcommand)]
+enum CanarySubcommand {
+    /// Shift a 1..99% slice of production traffic to a succeeded deployment.
+    Start(CanaryStartArgs),
+    /// Promote the active canary to 100% and clear the split.
+    Promote(CanaryEndArgs),
+    /// Drop the active canary split and keep current production at 100%.
+    Rollback(CanaryEndArgs),
+}
+
+#[derive(Args)]
+struct CanaryStartArgs {
+    /// App name (e.g. `gtd-tracker`); normalized to `app:<app>`. Accepts a literal `app:` ref.
+    app: String,
+
+    /// Deployment ref to receive the canary traffic slice.
+    #[arg(long = "deployment-ref")]
+    deployment_ref: String,
+
+    /// Canary traffic percentage. Must be an integer from 1 through 99.
+    #[arg(long)]
+    weight: u32,
+}
+
+#[derive(Args)]
+struct CanaryEndArgs {
+    /// App name (e.g. `gtd-tracker`); normalized to `app:<app>`. Accepts a literal `app:` ref.
+    app: String,
+
+    /// Deployment ref identifying the active canary or its production alias.
+    #[arg(long = "deployment-ref")]
+    deployment_ref: String,
+}
+
 #[derive(Args)]
 struct IdArgs {
     id: String,
@@ -458,6 +502,7 @@ fn run(cli: Cli) -> Result<(), String> {
         },
         Command::Versions(args) => map_versions(&cli, args),
         Command::Publish(args) => map_publish(&cli, args),
+        Command::Canary(args) => map_canary(&cli, args),
         Command::Status(args) => get(
             &cli,
             "/v1/map-control/deploy/status",
@@ -1464,6 +1509,169 @@ fn build_publish_body(
     body
 }
 
+// ───────────────────────────── map canary (ADR-0017) ─────────────────────────────
+
+fn map_canary(cli: &Cli, args: &CanaryArgs) -> Result<(), String> {
+    let request = canary_request(args)?;
+    let (http, state) = client(cli)?;
+    let response = http
+        .post(format!(
+            "{}{}",
+            state.map_control_endpoint.trim_end_matches('/'),
+            CANARY_DEPLOY_PATH,
+        ))
+        .bearer_auth(&state.access_token)
+        .json(&request.body)
+        .send()
+        .map_err(|error| format!("MAP request failed: {error}"))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|error| format!("read MAP response: {error}"))?;
+    if status != StatusCode::OK && status != StatusCode::CREATED && status != StatusCode::ACCEPTED {
+        return Err(format!("MAP returned {status}: {}", redact(&text)));
+    }
+    if cli.json {
+        println!("{text}");
+        return Ok(());
+    }
+
+    let value: Value =
+        serde_json::from_str(&text).map_err(|error| format!("parse canary response: {error}"))?;
+    print!("{}", render_canary_text(&request, &value));
+    Ok(())
+}
+
+struct CanaryRequest {
+    action: &'static str,
+    app: String,
+    app_ref: String,
+    deployment_ref: String,
+    weight_pct: Option<u32>,
+    body: Value,
+}
+
+fn canary_request(args: &CanaryArgs) -> Result<CanaryRequest, String> {
+    match &args.command {
+        CanarySubcommand::Start(start) => {
+            validate_canary_weight(start.weight)?;
+            let app_ref = normalize_app_ref(&start.app);
+            Ok(CanaryRequest {
+                action: "start",
+                app: app_ref.trim_start_matches("app:").to_string(),
+                app_ref: app_ref.clone(),
+                deployment_ref: start.deployment_ref.clone(),
+                weight_pct: Some(start.weight),
+                body: build_canary_body(
+                    "start",
+                    &app_ref,
+                    &start.deployment_ref,
+                    Some(start.weight),
+                ),
+            })
+        }
+        CanarySubcommand::Promote(promote) => canary_end_request("promote", promote),
+        CanarySubcommand::Rollback(rollback) => canary_end_request("rollback", rollback),
+    }
+}
+
+fn canary_end_request(action: &'static str, args: &CanaryEndArgs) -> Result<CanaryRequest, String> {
+    let app_ref = normalize_app_ref(&args.app);
+    Ok(CanaryRequest {
+        action,
+        app: app_ref.trim_start_matches("app:").to_string(),
+        app_ref: app_ref.clone(),
+        deployment_ref: args.deployment_ref.clone(),
+        weight_pct: None,
+        body: build_canary_body(action, &app_ref, &args.deployment_ref, None),
+    })
+}
+
+fn validate_canary_weight(weight_pct: u32) -> Result<(), String> {
+    if (1..=99).contains(&weight_pct) {
+        Ok(())
+    } else {
+        Err(format!(
+            "--weight must be an integer from 1 through 99, got {weight_pct}"
+        ))
+    }
+}
+
+fn build_canary_body(
+    action: &str,
+    app_ref: &str,
+    deployment_ref: &str,
+    weight_pct: Option<u32>,
+) -> Value {
+    let mut body = json!({
+        "app_ref": app_ref,
+        "canary_action": action,
+        "canary_deployment_ref": deployment_ref,
+    });
+    if let Some(weight_pct) = weight_pct {
+        body["weight_pct"] = json!(weight_pct);
+    }
+    body
+}
+
+fn render_canary_text(request: &CanaryRequest, response: &Value) -> String {
+    let response_action =
+        response
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or(match request.action {
+                "start" => "canary-start",
+                "promote" => "canary-promote",
+                "rollback" => "canary-rollback",
+                _ => "canary",
+            });
+    let status = response
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("ok");
+    let alias = response.get("alias").unwrap_or(&Value::Null);
+    let route_pointer_ref = alias
+        .get("route_pointer_ref")
+        .and_then(Value::as_str)
+        .unwrap_or("(not returned)");
+    let hostname = alias
+        .get("hostname")
+        .and_then(Value::as_str)
+        .unwrap_or("(not returned)");
+    let current = alias
+        .get("current_deployment_ref")
+        .and_then(Value::as_str)
+        .unwrap_or("(not returned)");
+    let canary = alias.get("canary_deployment_ref").and_then(Value::as_str);
+    let canary_weight = alias.get("canary_weight_pct").and_then(Value::as_u64);
+    let result = match request.action {
+        "start" => {
+            if let Some(weight) = canary_weight.or(request.weight_pct.map(u64::from)) {
+                format!(
+                    "{weight}% canary, {}% current",
+                    100_u64.saturating_sub(weight)
+                )
+            } else {
+                "canary split started".to_string()
+            }
+        }
+        "promote" => "promoted canary to current at 100%; split cleared".to_string(),
+        "rollback" => "rolled back canary; current remains at 100%; split cleared".to_string(),
+        _ => status.to_string(),
+    };
+
+    format!(
+        "action: {action}\nstatus: {status}\napp: {app}\napp_ref: {app_ref}\ncanary_deployment_ref: {deployment_ref}\nalias: {route_pointer_ref}\nhostname: {hostname}\ncurrent_deployment_ref: {current}\nactive_canary: {active_canary}\nresult: {result}\n",
+        action = response_action,
+        status = status,
+        app = request.app,
+        app_ref = request.app_ref,
+        deployment_ref = request.deployment_ref,
+        active_canary = canary.unwrap_or("(none)"),
+    )
+}
+
 // ───────────────────────────── map doctor (readiness) ─────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2454,5 +2662,193 @@ mod tests {
             Command::Versions(args) => assert_eq!(args.app, "gtd-tracker"),
             _ => panic!("expected versions"),
         }
+    }
+
+    // ── map canary (ADR-0017 #54) ──
+
+    #[test]
+    fn canary_start_parses_app_deployment_ref_and_weight() {
+        let cli = Cli::try_parse_from([
+            "map",
+            "canary",
+            "start",
+            "gtd-tracker",
+            "--deployment-ref",
+            "deployment://sandbox/production/gtd-2",
+            "--weight",
+            "20",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Canary(args) => match args.command {
+                CanarySubcommand::Start(start) => {
+                    assert_eq!(start.app, "gtd-tracker");
+                    assert_eq!(
+                        start.deployment_ref,
+                        "deployment://sandbox/production/gtd-2"
+                    );
+                    assert_eq!(start.weight, 20);
+                }
+                _ => panic!("expected canary start"),
+            },
+            _ => panic!("expected canary"),
+        }
+    }
+
+    #[test]
+    fn canary_promote_and_rollback_parse_deployment_ref() {
+        for command in ["promote", "rollback"] {
+            let cli = Cli::try_parse_from([
+                "map",
+                "canary",
+                command,
+                "gtd-tracker",
+                "--deployment-ref",
+                "deployment://sandbox/production/gtd-2",
+            ])
+            .expect("parses");
+            match cli.command {
+                Command::Canary(args) => match args.command {
+                    CanarySubcommand::Promote(end) | CanarySubcommand::Rollback(end) => {
+                        assert_eq!(end.app, "gtd-tracker");
+                        assert_eq!(end.deployment_ref, "deployment://sandbox/production/gtd-2");
+                    }
+                    _ => panic!("expected canary terminal action"),
+                },
+                _ => panic!("expected canary"),
+            }
+        }
+    }
+
+    #[test]
+    fn canary_start_validates_weight_locally() {
+        assert!(validate_canary_weight(1).is_ok());
+        assert!(validate_canary_weight(99).is_ok());
+        assert!(validate_canary_weight(0).is_err());
+        assert!(validate_canary_weight(100).is_err());
+    }
+
+    #[test]
+    fn canary_request_body_uses_control_plane_canary_shape() {
+        let args = CanaryArgs {
+            command: CanarySubcommand::Start(CanaryStartArgs {
+                app: "gtd-tracker".to_string(),
+                deployment_ref: "deployment://sandbox/production/gtd-2".to_string(),
+                weight: 20,
+            }),
+        };
+        let request = canary_request(&args).expect("valid request");
+        assert_eq!(CANARY_DEPLOY_PATH, "/v1/map-control/deploy/canary");
+        assert_eq!(request.body["app_ref"], "app:gtd-tracker");
+        assert_eq!(request.body["canary_action"], "start");
+        assert_eq!(
+            request.body["canary_deployment_ref"],
+            "deployment://sandbox/production/gtd-2"
+        );
+        assert_eq!(request.body["weight_pct"], 20);
+
+        let promote = build_canary_body(
+            "promote",
+            "app:gtd-tracker",
+            "deployment://sandbox/production/gtd-2",
+            None,
+        );
+        assert_eq!(promote["canary_action"], "promote");
+        assert_eq!(
+            promote["canary_deployment_ref"],
+            "deployment://sandbox/production/gtd-2"
+        );
+        assert!(promote.get("weight_pct").is_none());
+    }
+
+    #[test]
+    fn canary_start_text_reports_action_app_alias_hostname_and_split() {
+        let request = CanaryRequest {
+            action: "start",
+            app: "gtd-tracker".to_string(),
+            app_ref: "app:gtd-tracker".to_string(),
+            deployment_ref: "deployment://sandbox/production/gtd-2".to_string(),
+            weight_pct: Some(20),
+            body: json!({}),
+        };
+        let response = json!({
+            "status": "ok",
+            "action": "canary-start",
+            "alias": {
+                "route_pointer_ref": "route-pointer://sandbox/production/app:gtd-tracker",
+                "hostname": "gtd-tracker.apps.mithran.cloud",
+                "current_deployment_ref": "deployment://sandbox/production/gtd-1",
+                "canary_deployment_ref": "deployment://sandbox/production/gtd-2",
+                "canary_weight_pct": 20
+            },
+            "remote_authority": { "mode": "local" }
+        });
+        let text = render_canary_text(&request, &response);
+        assert!(text.contains("action: canary-start"));
+        assert!(text.contains("status: ok"));
+        assert!(text.contains("app: gtd-tracker"));
+        assert!(text.contains("canary_deployment_ref: deployment://sandbox/production/gtd-2"));
+        assert!(text.contains("alias: route-pointer://sandbox/production/app:gtd-tracker"));
+        assert!(text.contains("hostname: gtd-tracker.apps.mithran.cloud"));
+        assert!(text.contains("result: 20% canary, 80% current"));
+    }
+
+    #[test]
+    fn canary_terminal_text_reports_promote_and_rollback_results() {
+        let mut request = CanaryRequest {
+            action: "promote",
+            app: "gtd-tracker".to_string(),
+            app_ref: "app:gtd-tracker".to_string(),
+            deployment_ref: "deployment://sandbox/production/gtd-2".to_string(),
+            weight_pct: None,
+            body: json!({}),
+        };
+        let response = json!({
+            "status": "ok",
+            "action": "canary-promote",
+            "alias": {
+                "route_pointer_ref": "route-pointer://sandbox/production/app:gtd-tracker",
+                "hostname": "gtd-tracker.apps.mithran.cloud",
+                "current_deployment_ref": "deployment://sandbox/production/gtd-2",
+                "canary_deployment_ref": null,
+                "canary_weight_pct": null
+            }
+        });
+        let promoted = render_canary_text(&request, &response);
+        assert!(promoted.contains("result: promoted canary to current at 100%; split cleared"));
+        assert!(promoted.contains("active_canary: (none)"));
+
+        request.action = "rollback";
+        let rolled = render_canary_text(
+            &request,
+            &json!({ "status": "ok", "action": "canary-rollback", "alias": response["alias"] }),
+        );
+        assert!(
+            rolled.contains("result: rolled back canary; current remains at 100%; split cleared")
+        );
+    }
+
+    #[test]
+    fn canary_json_output_preserves_server_response_shape() {
+        let response = json!({
+            "status": "ok",
+            "action": "canary-start",
+            "alias": {
+                "hostname": "gtd-tracker.apps.mithran.cloud",
+                "canary_weight_pct": 20
+            },
+            "remote_authority": {
+                "mode": "local",
+                "decision_ref": "decision://canary"
+            },
+            "server_extra": { "kept": true }
+        });
+        let raw = serde_json::to_string(&response).expect("serializes");
+        let round_trip: Value = serde_json::from_str(&raw).expect("json output is raw JSON");
+        assert_eq!(
+            round_trip["remote_authority"]["decision_ref"],
+            "decision://canary"
+        );
+        assert_eq!(round_trip["server_extra"]["kept"], true);
     }
 }

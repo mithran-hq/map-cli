@@ -42,7 +42,8 @@ CLI entrypoint and command model:
 - `Cli` defines global `--login-state`, `--endpoint`, `--token`, and `--json`.
 - `Command` defines `login`, `whoami`, `doctor`, `init`, `validate`,
   `deploy`/`deploy-request`, `onboard`, `setup`, `access`, `versions`,
-  `publish`, `status`, `watch`, `logs`, `evidence`, `rollback`, and `version`.
+  `publish`, `canary`, `status`, `watch`, `logs`, `evidence`, `rollback`, and
+  `version`.
 
 Auth and local state:
 
@@ -87,7 +88,7 @@ Onboarding and BYO-CI:
   not fail onboarding.
 - `setup` is a deprecated scaffold-only shim for the BYO-CI workflow.
 
-Access and publish:
+Access, publish, and canary:
 
 - `resolve_access_policy` reads `access.yaml` or `--file`, rejects unknown
   fields, merges CLI overrides, defaults declared policy to `protected`, and
@@ -100,6 +101,13 @@ Access and publish:
 - `publish` resolves `--version` through `routes/status` or accepts
   `--deployment-ref`, then POSTs `/v1/map-control/deploy/publish` with optional
   `--expected-sha` and `--actor`.
+- `canary start` validates `--weight` locally as 1..99, normalizes `<app>` to
+  `app:<app>`, then POSTs `/v1/map-control/deploy/canary` with `canary_action:
+  start`, `canary_deployment_ref`, and `weight_pct`.
+- `canary promote` and `canary rollback` POST the same endpoint with
+  `canary_action: promote` or `rollback` and the named `canary_deployment_ref`.
+  Text output reports the action, app, deployment ref, alias/hostname when
+  returned, and result; `--json` prints the server response unchanged.
 
 Packaging and release:
 
@@ -125,6 +133,7 @@ Packaging and release:
 | `map access apply` | `POST /v1/map-control/access` |
 | `map versions` | `GET /v1/map-control/routes/status` |
 | `map publish` | `POST /v1/map-control/deploy/publish` |
+| `map canary start`, `map canary promote`, `map canary rollback` | `POST /v1/map-control/deploy/canary` |
 | `map status`, `map watch` | `GET /v1/map-control/deploy/status` |
 | `map evidence` | `GET /v1/map-control/deploy/evidence` |
 | `map rollback` | `POST /v1/map-control/deploy/rollback` |
@@ -191,6 +200,18 @@ map versions demo
 map publish demo --version demo-2 --expected-sha <40-hex-sha>
 ```
 
+Start, promote, or rollback a Forge canary:
+
+```bash
+map canary start demo \
+  --deployment-ref deployment://sandbox/production/demo-3 \
+  --weight 20
+map canary promote demo \
+  --deployment-ref deployment://sandbox/production/demo-3
+map canary rollback demo \
+  --deployment-ref deployment://sandbox/production/demo-3
+```
+
 Plan and apply app access:
 
 ```bash
@@ -253,6 +274,8 @@ architecture references are the central Forge docs linked above plus the root
 | `map logs` fails | This is expected: the live control plane exposes no deploy logs route. Use `map status` or `map evidence`. |
 | `map versions` shows no published version | The app has addressable internal versions but no external published pointer. Run `map publish` after a version has passed server review. |
 | `map publish` returns 409 | The version is stale or not publishable. Re-run `map versions`, verify the reviewed succeeded deployment, and pass the current `--expected-sha` if using the stale-safe guard. |
+| `map canary start` rejects `--weight` | Use an integer from 1 through 99. Use `promote` for 100% and `rollback` to clear the split. |
+| `map canary` returns canary target errors | Re-run `map versions` or `map status` and verify the named deployment exists and is succeeded/promoted before starting or ending a split. |
 | Packaging fails | Run `cargo build --release` first for `scripts/package_component.py`; for `scripts/package_host_component.py`, pass a built macOS `map` binary and supported `--target-arch aarch64`. |
 
 ## Review Checklist
@@ -266,4 +289,3 @@ Before closing a Forge CLI docs or behavior task:
 - Route, command, source path, and packaging claims match local source.
 - At least one local verification command has been run and recorded.
 - Changed docs do not create untracked required work.
-
