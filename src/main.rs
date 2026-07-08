@@ -659,9 +659,7 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
             .bearer_auth(&state.access_token)
             .send()
             .map_err(|error| format!("MAP watch failed: {error}"))?;
-        let value: Value = response
-            .json()
-            .map_err(|error| format!("read MAP watch response: {error}"))?;
+        let value = read_watch_response(response)?;
         let phase = value
             .get("deployment")
             .and_then(|deployment| deployment.get("status"))
@@ -686,6 +684,21 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
         thread::sleep(Duration::from_secs(args.interval_seconds));
         elapsed += args.interval_seconds;
     }
+}
+
+fn read_watch_response(response: reqwest::blocking::Response) -> Result<Value, String> {
+    parse_watch_response(response.status(), response.text())
+}
+
+fn parse_watch_response(
+    status: StatusCode,
+    text: Result<String, reqwest::Error>,
+) -> Result<Value, String> {
+    let text = text.map_err(|error| format!("read MAP watch response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("MAP returned {status}: {}", redact(&text)));
+    }
+    serde_json::from_str(&text).map_err(|error| format!("read MAP watch response: {error}"))
 }
 
 /// Terminal deployment phases reported by the control-plane deploy state
@@ -2071,6 +2084,34 @@ mod tests {
         for phase in ["IntentReceived", "BuildPending", "RuntimeReady", "unknown"] {
             assert!(!is_terminal_phase(phase), "{phase} must not be terminal");
         }
+    }
+
+    #[test]
+    fn watch_response_fails_fast_on_non_success_status() {
+        let err = parse_watch_response(
+            StatusCode::FORBIDDEN,
+            Ok(
+                r#"{"status":"error","code":"forbidden","message":"Bearer access_token denied"}"#
+                    .to_string(),
+            ),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            r#"MAP returned 403 Forbidden: {"status":"error","code":"forbidden","message":"[REDACTED] [REDACTED] denied"}"#
+        );
+    }
+
+    #[test]
+    fn watch_response_parses_success_body() {
+        let value = parse_watch_response(
+            StatusCode::OK,
+            Ok(r#"{"deployment":{"status":{"status":"Succeeded"}}}"#.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(value["deployment"]["status"]["status"], "Succeeded");
     }
 
     #[test]
