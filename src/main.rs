@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use map_deploy_review_contract::{MapDeployReviewContract, MapDeployReviewStatus};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -190,6 +190,11 @@ struct DeployReviewArgs {
 }
 
 #[derive(Args, Serialize)]
+#[command(group(
+    ArgGroup::new("source_selector")
+        .required(true)
+        .args(["ref_name", "sha"])
+))]
 struct DeployTarget {
     /// GitHub repository, either owner/repo or github://owner/repo.
     #[arg(long)]
@@ -2682,6 +2687,61 @@ mod tests {
     }
 
     #[test]
+    fn deploy_and_validate_require_ref_or_sha_at_parse_time() {
+        for args in [
+            vec!["map", "deploy", "--repo", "mithran-hq/demo"],
+            vec!["map", "validate", "--repo", "mithran-hq/demo"],
+        ] {
+            let err = match Cli::try_parse_from(args) {
+                Ok(_) => panic!("missing source selector should not parse"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains("--ref <REF_NAME>"), "{err}");
+            assert!(err.contains("--sha <SHA>"), "{err}");
+        }
+    }
+
+    #[test]
+    fn deploy_and_validate_accept_ref_or_sha_sources() {
+        for args in [
+            vec![
+                "map",
+                "deploy",
+                "--repo",
+                "mithran-hq/demo",
+                "--ref",
+                "refs/heads/main",
+            ],
+            vec![
+                "map",
+                "deploy",
+                "--repo",
+                "mithran-hq/demo",
+                "--sha",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+            vec![
+                "map",
+                "validate",
+                "--repo",
+                "mithran-hq/demo",
+                "--ref",
+                "refs/heads/main",
+            ],
+            vec![
+                "map",
+                "validate",
+                "--repo",
+                "mithran-hq/demo",
+                "--sha",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+        ] {
+            Cli::try_parse_from(args).expect("ref or sha source should parse");
+        }
+    }
+
+    #[test]
     fn deploy_review_parses_default_manifest_inputs() {
         let cli = Cli::try_parse_from(["map", "deploy-review"]).expect("parses");
         match cli.command {
@@ -2857,6 +2917,22 @@ identity: {project_ref: owner/repo}
                 help.contains(AUTH_FLAGS_HELP),
                 "{label} help should document auth globals:\n{help}"
             );
+        }
+    }
+
+    #[test]
+    fn deploy_and_validate_help_mark_source_selector_required() {
+        for path in [&["deploy"][..], &["validate"][..]] {
+            let mut command = Cli::command();
+            let help = render_help_for_path(&mut command, path);
+            let usage = help
+                .lines()
+                .find(|line| line.starts_with("Usage:"))
+                .unwrap_or_else(|| panic!("missing usage line:\n{help}"));
+
+            assert!(usage.contains("--repo <REPO>"), "{help}");
+            assert!(usage.contains("--ref <REF_NAME>"), "{help}");
+            assert!(usage.contains("--sha <SHA>"), "{help}");
         }
     }
 
