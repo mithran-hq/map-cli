@@ -15,8 +15,8 @@ control-plane routes, auth requirements, and verification evidence in
   machine.
 - Reviewing `mithran.yaml` locally against the public
   `map-deploy-review-contract` `map.mithran/v1` manifest contract before deploy.
-- Calling MAP control-plane deploy, onboard, access, route, publish, evidence,
-  rollback, status, and readiness endpoints.
+- Calling MAP control-plane deploy, onboard, offboard, access, route, publish,
+  evidence, rollback, status, and readiness endpoints.
 - Scaffolding `mithran.yaml` and, only when explicitly requested, the custom-CI
   GitHub Actions deploy workflow.
 - Packaging the `map` binary as an Aegis host component artifact.
@@ -37,9 +37,9 @@ CLI entrypoint and command model:
 - `Cli` defines global `--login-state`, `--endpoint`, `--token-file`,
   `--token-stdin`, `--token`, and `--json`.
 - `Command` defines `login`, `whoami`, `doctor`, `init`, `deploy-review`,
-  `validate`, `deploy`/`deploy-request`, `onboard`, `access`, `versions`,
-  `publish`, `canary`, `status`, `watch`, `logs`, `evidence`, `rollback`, and
-  `version`.
+  `validate`, `deploy`/`deploy-request`, `onboard`, `offboard`, `access`,
+  `versions`, `publish`, `canary`, `status`, `watch`, `logs`, `evidence`,
+  `rollback`, and `version`.
 
 Auth and local state:
 
@@ -92,6 +92,13 @@ Onboarding and Custom CI:
   in JSON and does not fail onboarding. Operators still need production values
   for `MAP_CONTROL_ENDPOINT` and `MAP_AUTH_ENDPOINT` before the custom-CI
   workflow can run.
+- `offboard` validates `owner/repo`, then POSTs `/v1/map-control/offboard`.
+  With `--installation-ref`, it removes only that repository/installation
+  source-registry binding. With `--all-installations`, it removes every
+  source-registry binding for the repository. It reports removed and remaining
+  binding counts in text output; `--json` prints the control-plane response
+  unchanged. Offboarding deploy intake does not remove route pointers or change
+  the published public URL.
 
 Access, publish, and canary:
 
@@ -137,6 +144,7 @@ Packaging and release:
 | `map deploy-review` | No HTTP call |
 | `map deploy`, `map deploy-request` | `POST /v1/map-control/deploy/request` |
 | `map onboard` | `POST /v1/map-control/onboard` |
+| `map offboard` | `POST /v1/map-control/offboard` |
 | `map access apply` | `POST /v1/map-control/access` |
 | `map versions` | `GET /v1/map-control/routes/status` |
 | `map publish` | `POST /v1/map-control/deploy/publish` |
@@ -201,6 +209,19 @@ map onboard mithran-hq/demo \
   --installation-ref github-installation://131136661 \
   --repo-dir ./demo \
   --with-ci-workflow
+```
+
+Offboard one repository/installation binding:
+
+```bash
+map offboard mithran-hq/demo \
+  --installation-ref github-installation://131136661
+```
+
+Offboard every installation binding for a repository:
+
+```bash
+map offboard mithran-hq/demo --all-installations
 ```
 
 Trigger a direct deploy request:
@@ -294,6 +315,8 @@ The root `README.md` is the high-level MAP CLI reference for this repo.
 | Deploy target validation fails | Pass exactly one usable source selector: `--ref <git-ref>` or `--sha <40-hex-sha>`. |
 | Deploy request is rejected by source policy | Check `--repo`, `--installation-ref`, `--app-ref`, tenant/account refs, and the control-plane source registry binding created by `map onboard`. |
 | `map onboard` returns a non-success response | Keep the redacted response body, then verify the repo slug, installation ref, account context, GitHub App grant, and control-plane source registry configuration before retrying. |
+| `map offboard` removed zero bindings | Verify the repo slug, installation ref, and current source-registry binding. The command is idempotent; a retry after a successful offboard can return `removed_binding_count: 0`. |
+| A repo still has a public route after `map offboard` | `map offboard` removes deploy intake bindings only. Route and published-pointer teardown are separate control-plane operations. |
 | `map onboard --with-ci-workflow` reports variable failures | Check `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`, plus repo permissions for Actions Variables. The variables are non-secret `MAP_*` values. |
 | Custom-CI workflow cannot mint a token | Check `id-token: write`, `MAP_AUTH_ENDPOINT`, `MAP_OIDC_AUDIENCE`, and whether the repository has an active onboarding binding. |
 | `map doctor` fails config or route checks | Check the saved endpoint, token, `/v1/map-control/config`, `/v1/map-control/routes/status`, and whether the app has an allowlist or registry binding. |

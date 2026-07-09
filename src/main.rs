@@ -22,6 +22,7 @@ const MAP_DEPLOY_WORKFLOW_TEMPLATE: &str = include_str!("../templates/map-deploy
 const USER_AGENT: &str = concat!("map-cli/", env!("CARGO_PKG_VERSION"));
 const DEPLOY_LOGS_PATH: &str = "/v1/map-control/deploy/logs";
 const CANARY_DEPLOY_PATH: &str = "/v1/map-control/deploy/canary";
+const OFFBOARD_PATH: &str = "/v1/map-control/offboard";
 const LIVE_ADAPTER_MODE: &str = "sandbox-live";
 const DEFAULT_STARTER_RUNTIME: &str = "nodejs22";
 const DEFAULT_STARTER_COMMAND: &str = "npm start";
@@ -87,6 +88,9 @@ enum Command {
     /// Register a GitHub repo with MAP and optionally scaffold local files.
     #[command(after_help = AUTH_FLAGS_HELP)]
     Onboard(OnboardArgs),
+    /// Remove a GitHub repo from MAP deploy intake.
+    #[command(after_help = AUTH_FLAGS_HELP)]
+    Offboard(OffboardArgs),
     /// Show onboarding guidance.
     #[command(hide = true)]
     Setup(SetupArgs),
@@ -333,6 +337,26 @@ struct OnboardArgs {
     /// Also scaffold the optional custom-CI deploy workflow and its repo Variables.
     #[arg(long, default_value_t = false)]
     with_ci_workflow: bool,
+}
+
+/// Remove source-registry onboarding bindings for a GitHub repo.
+#[derive(Args)]
+#[command(group(
+    ArgGroup::new("offboard_scope")
+        .required(true)
+        .args(["installation_ref", "all_installations"])
+))]
+struct OffboardArgs {
+    /// Repository to offboard, `owner/repo`.
+    repo: String,
+
+    /// Remove only this GitHub App installation binding.
+    #[arg(long, conflicts_with = "all_installations")]
+    installation_ref: Option<String>,
+
+    /// Remove all installation bindings for this repository.
+    #[arg(long, default_value_t = false, conflicts_with = "installation_ref")]
+    all_installations: bool,
 }
 
 #[derive(Args)]
@@ -594,6 +618,7 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Deploy(args) => deploy_request(&cli, args),
         Command::Onboard(args) => onboard(&cli, args),
+        Command::Offboard(args) => offboard(&cli, args),
         Command::Setup(args) => setup(&cli, args),
         Command::Access(args) => match &args.command {
             AccessSubcommand::Apply(apply) => access_apply(&cli, apply),
@@ -1311,6 +1336,82 @@ fn onboard_output(
             .unwrap_or_default(),
     );
     (payload, text)
+}
+
+// ───────────────────────────── map offboard ─────────────────────────────
+
+fn offboard(cli: &Cli, args: &OffboardArgs) -> Result<(), String> {
+    validate_repo_slug(&args.repo)?;
+    let repository_ref = format!("github://{}", args.repo);
+    let installation_ref = offboard_installation_ref(args)?;
+    let body = offboard_request_body(&repository_ref, installation_ref.as_deref());
+
+    let (http, state) = client(cli)?;
+    let response = http
+        .post(format!(
+            "{}{}",
+            state.map_control_endpoint.trim_end_matches('/'),
+            OFFBOARD_PATH
+        ))
+        .bearer_auth(&state.access_token)
+        .json(&body)
+        .send()
+        .map_err(|error| format!("offboard request failed: {error}"))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|error| format!("read offboard response: {error}"))?;
+    let value = parse_offboard_response(status, &text)?;
+    if cli.json {
+        println!("{text}");
+    } else {
+        println!(
+            "{}",
+            render_offboard_text(&args.repo, installation_ref.as_deref(), &value)
+        );
+    }
+    Ok(())
+}
+
+fn offboard_installation_ref(args: &OffboardArgs) -> Result<Option<String>, String> {
+    match args.installation_ref.as_deref() {
+        Some(value) if value.trim().is_empty() => {
+            Err("--installation-ref must not be empty".to_string())
+        }
+        Some(value) => Ok(Some(value.trim().to_string())),
+        None => Ok(None),
+    }
+}
+
+fn offboard_request_body(repository_ref: &str, installation_ref: Option<&str>) -> Value {
+    let mut body = json!({ "repository_ref": repository_ref });
+    if let Some(installation_ref) = installation_ref {
+        body["installation_ref"] = json!(installation_ref);
+    }
+    body
+}
+
+fn parse_offboard_response(status: StatusCode, text: &str) -> Result<Value, String> {
+    let value = serde_json::from_str::<Value>(text).ok();
+    if !status.is_success() {
+        let body = value.map_or_else(|| text.to_string(), |value| value.to_string());
+        return Err(format!("offboard returned {status}: {}", redact(&body)));
+    }
+    Ok(value.unwrap_or_else(|| json!({})))
+}
+
+fn render_offboard_text(repo: &str, installation_ref: Option<&str>, response: &Value) -> String {
+    let removed = response
+        .get("removed_binding_count")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "(not returned)".to_string(), |count| count.to_string());
+    let remaining = response
+        .get("remaining_binding_count")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "(not returned)".to_string(), |count| count.to_string());
+    let scope = installation_ref.unwrap_or("all installations");
+    format!("offboarded {repo} ({scope}): removed {removed}; remaining {remaining}")
 }
 
 /// ADR-0019: the `access.yaml` schema — an app's access policy declared as code. Every field
@@ -3136,6 +3237,7 @@ identity: {project_ref: owner/repo}
             &["doctor"][..],
             &["deploy"][..],
             &["onboard"][..],
+            &["offboard"][..],
             &["access"][..],
             &["access", "apply"][..],
             &["versions"][..],
@@ -3247,6 +3349,7 @@ identity: {project_ref: owner/repo}
             &["validate"][..],
             &["deploy"][..],
             &["onboard"][..],
+            &["offboard"][..],
             &["setup"][..],
             &["access"][..],
             &["access", "apply"][..],
@@ -3544,6 +3647,170 @@ identity: {project_ref: owner/repo}
         assert_eq!(
             err,
             "onboard conflict: repository binding conflict for [REDACTED] token"
+        );
+    }
+
+    #[test]
+    fn offboard_parses_single_installation_scope() {
+        let cli = Cli::try_parse_from([
+            "map",
+            "offboard",
+            "john-smith/my-app",
+            "--installation-ref",
+            "github-installation://131136661",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Offboard(args) => {
+                assert_eq!(args.repo, "john-smith/my-app");
+                assert_eq!(
+                    args.installation_ref.as_deref(),
+                    Some("github-installation://131136661")
+                );
+                assert!(!args.all_installations);
+            }
+            _ => panic!("expected offboard"),
+        }
+    }
+
+    #[test]
+    fn offboard_requires_explicit_scope_for_repo_wide_removal() {
+        assert!(Cli::try_parse_from(["map", "offboard", "john-smith/my-app"]).is_err());
+        assert!(Cli::try_parse_from([
+            "map",
+            "offboard",
+            "john-smith/my-app",
+            "--installation-ref",
+            "github-installation://131136661",
+            "--all-installations",
+        ])
+        .is_err());
+
+        let cli = Cli::try_parse_from([
+            "map",
+            "offboard",
+            "john-smith/my-app",
+            "--all-installations",
+        ])
+        .expect("repo-wide scope parses only when explicit");
+        match cli.command {
+            Command::Offboard(args) => {
+                assert_eq!(args.repo, "john-smith/my-app");
+                assert!(args.installation_ref.is_none());
+                assert!(args.all_installations);
+            }
+            _ => panic!("expected offboard"),
+        }
+    }
+
+    #[test]
+    fn offboard_rejects_empty_installation_ref_before_request_body() {
+        let args = OffboardArgs {
+            repo: "john-smith/my-app".to_string(),
+            installation_ref: Some("   ".to_string()),
+            all_installations: false,
+        };
+
+        assert_eq!(
+            offboard_installation_ref(&args),
+            Err("--installation-ref must not be empty".to_string())
+        );
+    }
+
+    #[test]
+    fn offboard_help_makes_removal_scope_clear() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("offboard")
+            .expect("offboard command")
+            .render_help()
+            .to_string();
+
+        assert!(help.contains("Remove a GitHub repo from MAP deploy intake"));
+        assert!(help.contains("--installation-ref"));
+        assert!(help.contains("Remove only this GitHub App installation binding"));
+        assert!(help.contains("--all-installations"));
+        assert!(help.contains("Remove all installation bindings for this repository"));
+    }
+
+    #[test]
+    fn offboard_request_body_uses_control_plane_shape() {
+        let single = offboard_request_body(
+            "github://john-smith/my-app",
+            Some("github-installation://131136661"),
+        );
+        assert_eq!(OFFBOARD_PATH, "/v1/map-control/offboard");
+        assert_eq!(single["repository_ref"], "github://john-smith/my-app");
+        assert_eq!(
+            single["installation_ref"],
+            "github-installation://131136661"
+        );
+
+        let all = offboard_request_body("github://john-smith/my-app", None);
+        assert_eq!(all["repository_ref"], "github://john-smith/my-app");
+        assert!(all.get("installation_ref").is_none());
+    }
+
+    #[test]
+    fn offboard_text_reports_removed_and_remaining_counts() {
+        let text = render_offboard_text(
+            "john-smith/my-app",
+            Some("github-installation://131136661"),
+            &json!({
+                "status": "offboarded",
+                "repository_ref": "github://john-smith/my-app",
+                "installation_ref": "github-installation://131136661",
+                "removed_binding_count": 1,
+                "remaining_binding_count": 0,
+            }),
+        );
+        assert_eq!(
+            text,
+            "offboarded john-smith/my-app (github-installation://131136661): removed 1; remaining 0"
+        );
+
+        let repo_wide = render_offboard_text(
+            "john-smith/my-app",
+            None,
+            &json!({
+                "removed_binding_count": 2,
+                "remaining_binding_count": 0,
+            }),
+        );
+        assert_eq!(
+            repo_wide,
+            "offboarded john-smith/my-app (all installations): removed 2; remaining 0"
+        );
+    }
+
+    #[test]
+    fn offboard_json_output_preserves_server_response_shape() {
+        let response = json!({
+            "status": "offboarded",
+            "repository_ref": "github://john-smith/my-app",
+            "installation_ref": null,
+            "removed_binding_count": 2,
+            "remaining_binding_count": 0,
+            "server_extra": { "kept": true }
+        });
+        let raw = serde_json::to_string(&response).expect("serializes");
+        let parsed = parse_offboard_response(StatusCode::OK, &raw).expect("parses");
+
+        assert_eq!(parsed["removed_binding_count"], 2);
+        assert_eq!(parsed["server_extra"]["kept"], true);
+    }
+
+    #[test]
+    fn offboard_response_errors_are_redacted() {
+        let err = parse_offboard_response(
+            StatusCode::FORBIDDEN,
+            r#"{"status":"error","message":"Bearer access_token denied"}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            r#"offboard returned 403 Forbidden: {"message":"[REDACTED] [REDACTED] denied","status":"error"}"#
         );
     }
 

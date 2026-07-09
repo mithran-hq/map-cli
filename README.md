@@ -33,6 +33,10 @@ map onboard mithran-hq/demo --installation-ref github-installation://131136661 -
 map onboard mithran-hq/demo --installation-ref github-installation://131136661 \
   --repo-dir ./demo --with-ci-workflow
 
+# Offboard a repo from MAP deploy intake. Use --installation-ref for one
+# GitHub App installation binding, or --all-installations for repo-wide removal.
+map offboard mithran-hq/demo --installation-ref github-installation://131136661
+
 # Diagnose readiness against the saved control-plane endpoint.
 map doctor --app mithran-hq/demo
 
@@ -83,6 +87,10 @@ per-repo deploy secret.
   authenticated control-plane endpoint. No GitHub Actions workflow is dispatched.
 - `map onboard <owner/repo> --installation-ref <ref>` records the source-registry binding and
   scaffolds a starter `mithran.yaml`. It writes **no** repo workflow by default.
+- `map offboard <owner/repo> --installation-ref <ref>` removes one repository/installation
+  source-registry binding from deploy intake. `--all-installations` removes every binding for
+  the repository. Offboarding deploy intake does not remove route pointers or change the
+  published public URL.
 - `map deploy-review [--repo-root .] [--manifest mithran.yaml]` reviews the app manifest locally
   before deploy. It uses the public `map-deploy-review-contract` crate for the
   `map.mithran/v1` contract and emits hard blocking `ERR_*` findings. It does not upload
