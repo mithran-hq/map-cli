@@ -1,4 +1,4 @@
-# Forge CLI Operator Guide
+# MAP CLI Operator Guide
 
 This guide maps the operator-facing MAP CLI surface to commands,
 control-plane routes, auth requirements, and verification evidence in
@@ -223,7 +223,7 @@ map versions demo
 map publish demo --version demo-2 --expected-sha <40-hex-sha>
 ```
 
-Start, promote, or rollback a Forge canary:
+Start, promote, or rollback a MAP canary:
 
 ```bash
 map canary start demo \
@@ -306,7 +306,7 @@ The root `README.md` is the high-level MAP CLI reference for this repo.
 
 ## Review Checklist
 
-Before closing a Forge CLI docs or behavior task:
+Before closing a MAP CLI docs or behavior task:
 
 - The docs index links this guide.
 - CLI-owned behavior is separated from control-plane, Auth, sidecar,

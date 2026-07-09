@@ -32,7 +32,7 @@ const LOGIN_SAVE_HELP: &str = "State path flag: --login-state <path>\nToken inpu
 #[command(
     name = "map",
     version,
-    about = "Deploy, inspect, publish, and manage Forge apps",
+    about = "Deploy, inspect, publish, and manage MAP apps",
     after_help = AUTH_FLAGS_HELP
 )]
 struct Cli {
@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long, global = true, hide = true)]
     login_state: Option<PathBuf>,
 
-    /// Override the Forge control-plane endpoint for this command.
+    /// Override the MAP control-plane endpoint for this command.
     #[arg(long, global = true, hide = true)]
     endpoint: Option<String>,
 
@@ -66,10 +66,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Save or print local Forge login state.
+    /// Save or print local MAP login state.
     #[command(after_help = AUTH_FLAGS_HELP)]
     Login(LoginCommand),
-    /// Show the saved Forge account and endpoint.
+    /// Show the saved MAP account and endpoint.
     #[command(after_help = AUTH_FLAGS_HELP)]
     Whoami,
     /// Check control-plane readiness and optional app diagnostics.
@@ -84,7 +84,7 @@ enum Command {
     /// Request a deploy directly. Built-in GitHub App webhooks are preferred for standard refs.
     #[command(alias = "deploy-request", after_help = AUTH_FLAGS_HELP)]
     Deploy(DeployRequestArgs),
-    /// Register a GitHub repo with Forge and optionally scaffold local files.
+    /// Register a GitHub repo with MAP and optionally scaffold local files.
     #[command(after_help = AUTH_FLAGS_HELP)]
     Onboard(OnboardArgs),
     /// Show onboarding guidance.
@@ -144,7 +144,7 @@ enum LoginSubcommand {
         .args(["access_token", "access_token_file", "access_token_stdin"])
 ))]
 struct LoginSaveArgs {
-    /// Forge control-plane endpoint to save.
+    /// MAP control-plane endpoint to save.
     #[arg(long)]
     map_control_endpoint: String,
 
@@ -271,7 +271,7 @@ struct DeployRequestArgs {
     evidence_ref: Option<String>,
 }
 
-/// Run readiness checks against the saved Forge control-plane endpoint.
+/// Run readiness checks against the saved MAP control-plane endpoint.
 #[derive(Args)]
 struct DoctorArgs {
     /// Also diagnose a specific app `owner/repo` (source access + alias/recent deployment).
@@ -297,7 +297,7 @@ struct SetupArgs {
     with_ci_workflow: bool,
 }
 
-/// Register a GitHub repo with Forge. The default path uses GitHub App webhooks
+/// Register a GitHub repo with MAP. The default path uses GitHub App webhooks
 /// and does not write a repo workflow.
 #[derive(Args)]
 struct OnboardArgs {
@@ -343,7 +343,7 @@ struct AccessArgs {
 
 #[derive(Subcommand)]
 enum AccessSubcommand {
-    /// Apply the resolved access policy to Forge.
+    /// Apply the resolved access policy to MAP.
     #[command(after_help = AUTH_FLAGS_HELP)]
     Apply(AccessApplyArgs),
     /// Print the resolved access policy without applying it (no control-plane call).
@@ -3234,6 +3234,7 @@ identity: {project_ref: owner/repo}
             "Aegis.app",
             "sandbox",
             "staging",
+            "Forge",
         ];
 
         for path in [
@@ -3275,6 +3276,23 @@ identity: {project_ref: owner/repo}
                     "{label} help should not contain internal term {term}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn public_docs_do_not_use_stale_forge_name() {
+        for (path, body) in [
+            ("README.md", include_str!("../README.md")),
+            ("docs/README.md", include_str!("../docs/README.md")),
+            (
+                "docs/map-cli-operator-guide.md",
+                include_str!("../docs/map-cli-operator-guide.md"),
+            ),
+        ] {
+            assert!(
+                !body.to_ascii_lowercase().contains("forge"),
+                "{path} should use MAP product language"
+            );
         }
     }
 

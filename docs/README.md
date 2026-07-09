@@ -1,5 +1,5 @@
 # MAP CLI Docs
 
-- [Forge CLI operator guide](forge-cli-operator-guide.md)
+- [MAP CLI operator guide](map-cli-operator-guide.md)
 - [Root README](../README.md)
 - [Custom-CI deploy workflow template](../templates/map-deploy.yml)

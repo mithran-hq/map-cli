@@ -50,7 +50,7 @@ map versions demo
 # Publish a reviewed, succeeded internal version to the app's clean public URL.
 map publish demo --version demo-2
 
-# Start, promote, or rollback a Forge canary on the production alias.
+# Start, promote, or rollback a MAP canary on the production alias.
 map canary start demo --deployment-ref "$DEPLOYMENT_REF" --weight 20
 map canary promote demo --deployment-ref "$DEPLOYMENT_REF"
 ```
