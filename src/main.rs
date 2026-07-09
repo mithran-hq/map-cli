@@ -1,4 +1,4 @@
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{error::ErrorKind, ArgGroup, Args, Parser, Subcommand};
 use map_deploy_review_contract::{MapDeployReviewContract, MapDeployReviewStatus};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -28,6 +28,7 @@ const DEFAULT_STARTER_RUNTIME: &str = "nodejs22";
 const DEFAULT_STARTER_COMMAND: &str = "npm start";
 const AUTH_FLAGS_HELP: &str = "Authentication flags: --login-state <path>, or --endpoint <url> with --token-file <path>, --token-stdin, or --token <token>";
 const LOGIN_SAVE_HELP: &str = "State path flag: --login-state <path>\nToken input: prefer --access-token-file <path> or --access-token-stdin; --access-token <token> is also accepted.";
+const JSON_OUTPUT_ALREADY_EMITTED_ERROR: &str = "__map_json_output_already_emitted:";
 
 #[derive(Parser)]
 #[command(
@@ -526,10 +527,44 @@ struct Principal {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let json_output = env::args().any(|arg| arg == "--json");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = clap_exit_code(error.kind());
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                let _ = error.print();
+            } else if json_output {
+                print_error_json(
+                    &ErrorReport::new(
+                        "invalid_usage",
+                        "invalid_usage",
+                        error.to_string(),
+                        exit_code,
+                    ),
+                    true,
+                );
+            } else {
+                let _ = error.print();
+            }
+            std::process::exit(exit_code);
+        }
+    };
+    let json_output = cli.json;
     if let Err(error) = run(cli) {
-        eprintln!("map: {}", redact(&error));
-        std::process::exit(1);
+        if json_output_already_emitted(&error) {
+            std::process::exit(1);
+        }
+        let report = classify_error(&error);
+        if json_output {
+            print_error_json(&report, false);
+        } else {
+            eprintln!("map: {}", report.message);
+        }
+        std::process::exit(report.exit_code);
     }
 }
 
@@ -827,6 +862,9 @@ fn emit_deploy_review(json_output: bool, review: &MapDeployReviewContract) -> Re
                 println!("deploy review passed: {}", review.manifest_path);
             }
             Ok(())
+        }
+        MapDeployReviewStatus::Blocked if json_output => {
+            Err(json_output_already_emitted_error("deploy_review_blocked"))
         }
         MapDeployReviewStatus::Blocked => Err(format_deploy_review_blocked(review)),
     }
@@ -1175,6 +1213,118 @@ fn print_json_or_text(json_output: bool, payload: Value, text: &str) -> Result<(
         println!("{text}");
     }
     Ok(())
+}
+
+struct ErrorReport {
+    category: &'static str,
+    code: &'static str,
+    message: String,
+    exit_code: i32,
+}
+
+impl ErrorReport {
+    fn new(category: &'static str, code: &'static str, message: String, exit_code: i32) -> Self {
+        Self {
+            category,
+            code,
+            message: redact(&message),
+            exit_code,
+        }
+    }
+}
+
+fn clap_exit_code(kind: ErrorKind) -> i32 {
+    match kind {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+        _ => 2,
+    }
+}
+
+fn classify_error(error: &str) -> ErrorReport {
+    if is_invalid_usage_error(error) {
+        ErrorReport::new("invalid_usage", error_code(error), error.to_string(), 2)
+    } else {
+        ErrorReport::new("runtime_error", error_code(error), error.to_string(), 1)
+    }
+}
+
+fn is_invalid_usage_error(error: &str) -> bool {
+    error.starts_with("--sha must be ")
+        || error.starts_with("deploy target requires ")
+        || error.contains(" is not a valid `owner/repo`")
+        || error.starts_with("explicit token auth requires ")
+        || error.starts_with("missing token source:")
+        || error.starts_with("empty token from input;")
+        || error.starts_with("--installation-ref must not be empty")
+        || error.starts_with("no app_ref:")
+        || error.starts_with("exposure must be ")
+        || error.starts_with("--weight must be ")
+        || error.starts_with("pick a version to publish:")
+        || error.starts_with("no GitHub token:")
+}
+
+fn error_code(error: &str) -> &'static str {
+    if error.starts_with("--sha must be ") {
+        "invalid_sha"
+    } else if error.starts_with("deploy target requires ") {
+        "missing_deploy_target"
+    } else if error.contains(" is not a valid `owner/repo`") {
+        "invalid_repo"
+    } else if error.starts_with("explicit token auth requires ")
+        || error.starts_with("missing token source:")
+        || error.starts_with("empty token from input;")
+    {
+        "invalid_token_input"
+    } else if error.starts_with("--installation-ref must not be empty") {
+        "invalid_installation_ref"
+    } else if error.starts_with("no app_ref:") {
+        "missing_app_ref"
+    } else if error.starts_with("exposure must be ") {
+        "invalid_exposure"
+    } else if error.starts_with("--weight must be ") {
+        "invalid_weight"
+    } else if error.starts_with("pick a version to publish:") {
+        "missing_publish_target"
+    } else if error.starts_with("no GitHub token:") {
+        "missing_github_token"
+    } else if error.starts_with("read login state ") {
+        "login_state_unavailable"
+    } else if error.starts_with("MAP returned ") {
+        "map_request_failed"
+    } else {
+        "command_failed"
+    }
+}
+
+fn json_output_already_emitted_error(code: &str) -> String {
+    format!("{JSON_OUTPUT_ALREADY_EMITTED_ERROR}{code}")
+}
+
+fn json_output_already_emitted(error: &str) -> bool {
+    error.starts_with(JSON_OUTPUT_ALREADY_EMITTED_ERROR)
+}
+
+fn print_error_json(report: &ErrorReport, trim_message: bool) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&error_json_value(report, trim_message)).unwrap()
+    );
+}
+
+fn error_json_value(report: &ErrorReport, trim_message: bool) -> Value {
+    let message = if trim_message {
+        report.message.trim().to_string()
+    } else {
+        report.message.clone()
+    };
+    json!({
+        "ok": false,
+        "error": {
+            "category": report.category,
+            "code": report.code,
+            "message": message,
+        }
+    })
 }
 
 fn redact(text: &str) -> String {
@@ -2854,6 +3004,108 @@ mod tests {
             err,
             "deploy target requires --ref <git-ref> or --sha <40-character-git-sha>"
         );
+    }
+
+    #[test]
+    fn runtime_validation_errors_are_invalid_usage() {
+        for (message, code) in [
+            ("--sha must be a 40-character Git SHA", "invalid_sha"),
+            (
+                "`demo` is not a valid `owner/repo`",
+                "invalid_repo",
+            ),
+            (
+                "missing token source: pass --token-file <path>, --token-stdin, or --token <token>",
+                "invalid_token_input",
+            ),
+            (
+                "explicit token auth requires --endpoint <url>. Pass `--endpoint <url>` with `--token-file <path>`, `--token-stdin`, or `--token <token>`.",
+                "invalid_token_input",
+            ),
+            (
+                "--installation-ref must not be empty",
+                "invalid_installation_ref",
+            ),
+            (
+                "no app_ref: set it in access.yaml or pass --app-ref app:<name>",
+                "missing_app_ref",
+            ),
+            (
+                "exposure must be 'public' or 'protected', got 'private'",
+                "invalid_exposure",
+            ),
+            (
+                "--weight must be an integer from 1 through 99, got 0",
+                "invalid_weight",
+            ),
+            (
+                "pick a version to publish: pass --version <label> or --deployment-ref <ref> (run `map versions demo` to list)",
+                "missing_publish_target",
+            ),
+        ] {
+            let report = classify_error(message);
+            assert_eq!(report.category, "invalid_usage", "{message}");
+            assert_eq!(report.code, code, "{message}");
+            assert_eq!(report.exit_code, 2, "{message}");
+        }
+    }
+
+    #[test]
+    fn operational_errors_keep_runtime_exit_code() {
+        let report = classify_error(
+            "read login state /tmp/missing: No such file or directory. Run `map login save --map-control-endpoint <url> --access-token-file <path>` to save login state",
+        );
+
+        assert_eq!(report.category, "runtime_error");
+        assert_eq!(report.code, "login_state_unavailable");
+        assert_eq!(report.exit_code, 1);
+    }
+
+    #[test]
+    fn json_error_envelope_has_stable_fields() {
+        let report = classify_error(
+            "read login state /tmp/missing: No such file or directory. Run `map login save --map-control-endpoint <url> --access-token-file <path>` to save login state",
+        );
+        let payload = error_json_value(&report, false);
+
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["error"]["category"], "runtime_error");
+        assert_eq!(payload["error"]["code"], "login_state_unavailable");
+        assert!(payload["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("map login save"));
+    }
+
+    #[test]
+    fn json_output_already_emitted_sentinel_suppresses_second_error_payload() {
+        let review = map_deploy_review_contract::review_manifest(
+            Some(
+                r#"
+apiVersion: wrong/v0
+kind: MithranApp
+metadata: {app_id: acme, name: Acme}
+identity: {project_ref: owner/repo}
+"#,
+            ),
+            "mithran.yaml",
+        );
+
+        let err = emit_deploy_review(true, &review).unwrap_err();
+
+        assert!(json_output_already_emitted(&err), "{err}");
+    }
+
+    #[test]
+    fn error_reports_redact_secret_markers() {
+        let report = classify_error(
+            r#"MAP returned 403 Forbidden: {"message":"Bearer access_token denied"}"#,
+        );
+
+        assert_eq!(report.category, "runtime_error");
+        assert_eq!(report.code, "map_request_failed");
+        assert!(!report.message.contains("Bearer"));
+        assert!(!report.message.contains("access_token"));
     }
 
     #[test]
