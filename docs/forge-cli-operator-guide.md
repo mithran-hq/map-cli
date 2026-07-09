@@ -34,7 +34,8 @@ CLI entrypoint and command model:
 
 - `src/main.rs` defines the `map` binary, global flags, subcommands, command
   arguments, and all command handlers.
-- `Cli` defines global `--login-state`, `--endpoint`, `--token`, and `--json`.
+- `Cli` defines global `--login-state`, `--endpoint`, `--token-file`,
+  `--token-stdin`, `--token`, and `--json`.
 - `Command` defines `login`, `whoami`, `doctor`, `init`, `deploy-review`,
   `validate`, `deploy`/`deploy-request`, `onboard`, `access`, `versions`,
   `publish`, `canary`, `status`, `watch`, `logs`, `evidence`, `rollback`, and
@@ -48,12 +49,14 @@ Auth and local state:
 - `login_state_path` reads `--login-state`, `MITHRAN_LOGIN_STATE`,
   `AEGIS_LOGIN_STATE`, or defaults to `$XDG_CONFIG_HOME/mithran/login.json`
   with `$HOME/.config/mithran/login.json` as the home fallback.
-- `map login save` writes local JSON state.
+- `map login save` writes local JSON state. Prefer `--access-token-file` or
+  `--access-token-stdin`; `--access-token` remains available for existing
+  automation.
 - `map login print-token --audience <audience>` prints the saved token only
   when the state audience matches, has `map:*`, or carries
   `audience:<audience>`.
-- `--endpoint` plus `--token` bypasses local state and creates an in-memory
-  `map-control` login for that command.
+- `--endpoint` plus `--token-file`, `--token-stdin`, or `--token` bypasses
+  local state and creates an in-memory `map-control` login for that command.
 
 Deploy and status flow:
 
@@ -157,7 +160,18 @@ Save a MAP control login:
 ```bash
 map login save \
   --map-control-endpoint https://map.example.com \
-  --access-token "$MITHRAN_TOKEN" \
+  --access-token-file ~/.config/mithran/map-token \
+  --scope map:* \
+  --scope audience:jason-controller
+```
+
+When the token is only available in the current shell, pipe it instead of
+placing it in argv:
+
+```bash
+printf '%s' "$MITHRAN_TOKEN" | map login save \
+  --map-control-endpoint https://map.example.com \
+  --access-token-stdin \
   --scope map:* \
   --scope audience:jason-controller
 ```
@@ -166,7 +180,10 @@ Use explicit endpoint and token for one command:
 
 ```bash
 map --endpoint https://map.example.com \
-  --token "$MITHRAN_TOKEN" doctor
+  --token-file ~/.config/mithran/map-token doctor
+
+printf '%s' "$MITHRAN_TOKEN" | map --endpoint https://map.example.com \
+  --token-stdin doctor
 ```
 
 Onboard a repository for the GitHub App webhook path:
@@ -239,6 +256,7 @@ Focused evidence:
 
 ```bash
 tmpdir=$(mktemp -d)
+printf '%s' test-token > /tmp/map-token
 cargo run -- init --manifest "$tmpdir/mithran.yaml"
 cargo run -- deploy-review --repo-root "$tmpdir"
 cargo run -- --json deploy-review --repo-root "$tmpdir"
@@ -247,7 +265,7 @@ cargo run -- validate --repo mithran-hq/demo --sha 0123456789abcdef0123456789abc
 cargo run -- login save \
   --login-state /tmp/map-login.json \
   --map-control-endpoint https://map.example.com \
-  --access-token test-token \
+  --access-token-file /tmp/map-token \
   --scope map:*
 python3 scripts/package_host_component.py \
   --binary target/release/map \
@@ -271,7 +289,7 @@ The root `README.md` is the high-level MAP CLI reference for this repo.
 
 | Symptom | Inspect |
 | --- | --- |
-| `map` cannot read login state | Check `--login-state`, `MITHRAN_LOGIN_STATE`, `AEGIS_LOGIN_STATE`, `$XDG_CONFIG_HOME/mithran/login.json`, and `$HOME/.config/mithran/login.json`. Run `map login save` or pass `--endpoint` and `--token`. |
+| `map` cannot read login state | Check `--login-state`, `MITHRAN_LOGIN_STATE`, `AEGIS_LOGIN_STATE`, `$XDG_CONFIG_HOME/mithran/login.json`, and `$HOME/.config/mithran/login.json`. Run `map login save --access-token-file <path>` or pass `--endpoint` and `--token-file <path>`. |
 | `print-token` rejects the requested audience | Check login state `audience` and `scopes`. The state must match the requested audience, contain `map:*`, or contain `audience:<audience>`. |
 | Deploy target validation fails | Pass exactly one usable source selector: `--ref <git-ref>` or `--sha <40-hex-sha>`. |
 | Deploy request is rejected by source policy | Check `--repo`, `--installation-ref`, `--app-ref`, tenant/account refs, and the control-plane source registry binding created by `map onboard`. |

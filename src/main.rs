@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -24,9 +25,8 @@ const CANARY_DEPLOY_PATH: &str = "/v1/map-control/deploy/canary";
 const LIVE_ADAPTER_MODE: &str = "sandbox-live";
 const DEFAULT_STARTER_RUNTIME: &str = "nodejs22";
 const DEFAULT_STARTER_COMMAND: &str = "npm start";
-const AUTH_FLAGS_HELP: &str =
-    "Authentication flags: --login-state <path>, --endpoint <url>, --token <token>";
-const LOGIN_STATE_FLAG_HELP: &str = "State path flag: --login-state <path>";
+const AUTH_FLAGS_HELP: &str = "Authentication flags: --login-state <path>, or --endpoint <url> with --token-file <path>, --token-stdin, or --token <token>";
+const LOGIN_SAVE_HELP: &str = "State path flag: --login-state <path>\nToken input: prefer --access-token-file <path> or --access-token-stdin; --access-token <token> is also accepted.";
 
 #[derive(Parser)]
 #[command(
@@ -45,8 +45,16 @@ struct Cli {
     endpoint: Option<String>,
 
     /// Bearer token for this command. Prefer saved login state for interactive use.
-    #[arg(long, global = true, hide = true)]
+    #[arg(long, global = true, hide = true, conflicts_with_all = ["token_file", "token_stdin"])]
     token: Option<String>,
+
+    /// Read the one-command bearer token from a file.
+    #[arg(long, global = true, hide = true, conflicts_with_all = ["token", "token_stdin"])]
+    token_file: Option<PathBuf>,
+
+    /// Read the one-command bearer token from stdin.
+    #[arg(long, global = true, hide = true, conflicts_with_all = ["token", "token_file"])]
+    token_stdin: bool,
 
     /// Print structured JSON when the command supports it.
     #[arg(long, global = true)]
@@ -122,7 +130,7 @@ struct LoginCommand {
 #[derive(Subcommand)]
 enum LoginSubcommand {
     /// Save control-plane endpoint and token metadata locally.
-    #[command(after_help = LOGIN_STATE_FLAG_HELP)]
+    #[command(after_help = LOGIN_SAVE_HELP)]
     Save(LoginSaveArgs),
     /// Print the saved token for an allowed audience.
     #[command(after_help = AUTH_FLAGS_HELP)]
@@ -130,6 +138,11 @@ enum LoginSubcommand {
 }
 
 #[derive(Args)]
+#[command(group(
+    ArgGroup::new("access_token_source")
+        .required(true)
+        .args(["access_token", "access_token_file", "access_token_stdin"])
+))]
 struct LoginSaveArgs {
     /// Forge control-plane endpoint to save.
     #[arg(long)]
@@ -141,7 +154,15 @@ struct LoginSaveArgs {
 
     /// Bearer token to save in the login state file.
     #[arg(long)]
-    access_token: String,
+    access_token: Option<String>,
+
+    /// Read the bearer token to save from a file.
+    #[arg(long)]
+    access_token_file: Option<PathBuf>,
+
+    /// Read the bearer token to save from stdin.
+    #[arg(long)]
+    access_token_stdin: bool,
 
     /// Audience this login state is valid for.
     #[arg(long, default_value = "map-control")]
@@ -493,10 +514,18 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Login(LoginCommand {
             command: LoginSubcommand::Save(args),
         }) => {
+            let access_token = read_token_input(
+                "--access-token",
+                args.access_token.as_ref(),
+                "--access-token-file",
+                args.access_token_file.as_ref(),
+                args.access_token_stdin,
+                "--access-token-stdin",
+            )?;
             let state = LoginState {
                 map_control_endpoint: args.map_control_endpoint.clone(),
                 jason_controller_endpoint: args.jason_controller_endpoint.clone(),
-                access_token: args.access_token.clone(),
+                access_token,
                 expires_at: args.expires_at.clone(),
                 audience: Some(args.audience.clone()),
                 scopes: args.scopes.clone(),
@@ -602,16 +631,32 @@ fn run(cli: Cli) -> Result<(), String> {
 }
 
 fn resolve_state(cli: &Cli) -> Result<LoginState, String> {
-    if let (Some(endpoint), Some(token)) = (&cli.endpoint, &cli.token) {
+    let has_explicit_token_source =
+        cli.token.is_some() || cli.token_file.is_some() || cli.token_stdin;
+    if let (Some(endpoint), true) = (&cli.endpoint, has_explicit_token_source) {
+        let token = read_token_input(
+            "--token",
+            cli.token.as_ref(),
+            "--token-file",
+            cli.token_file.as_ref(),
+            cli.token_stdin,
+            "--token-stdin",
+        )?;
         return Ok(LoginState {
             map_control_endpoint: endpoint.clone(),
             jason_controller_endpoint: None,
-            access_token: token.clone(),
+            access_token: token,
             expires_at: None,
             audience: Some("map-control".to_string()),
             scopes: vec![],
             principal: None,
         });
+    }
+    if has_explicit_token_source {
+        return Err(format!(
+            "explicit token auth requires --endpoint <url>. {}",
+            one_command_auth_hint()
+        ));
     }
     let path = login_state_path(cli.login_state.as_ref())?;
     let text = fs::read_to_string(&path).map_err(|error| {
@@ -621,11 +666,58 @@ fn resolve_state(cli: &Cli) -> Result<LoginState, String> {
             login_recovery_hint()
         )
     })?;
-    serde_json::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
+    let mut state: LoginState = serde_json::from_str(&text)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if let Some(endpoint) = &cli.endpoint {
+        state.map_control_endpoint = endpoint.clone();
+    }
+    Ok(state)
 }
 
 fn login_recovery_hint() -> &'static str {
-    "Run `map login save --map-control-endpoint <url> --access-token <token>` to save login state, or pass `--endpoint <url> --token <token>` for one command."
+    "Run `map login save --map-control-endpoint <url> --access-token-file <path>` to save login state, or pass `--endpoint <url> --token-file <path>` for one command. Use --access-token-stdin or --token-stdin when piping a token."
+}
+
+fn one_command_auth_hint() -> &'static str {
+    "Pass `--endpoint <url>` with `--token-file <path>`, `--token-stdin`, or `--token <token>`."
+}
+
+fn read_token_input(
+    token_flag: &str,
+    token: Option<&String>,
+    token_file_flag: &str,
+    token_file: Option<&PathBuf>,
+    token_stdin: bool,
+    token_stdin_flag: &str,
+) -> Result<String, String> {
+    let token = if let Some(token) = token {
+        token.clone()
+    } else if let Some(path) = token_file {
+        fs::read_to_string(path).map_err(|error| {
+            format!(
+                "read token from {token_file_flag} {}: {error}",
+                path.display()
+            )
+        })?
+    } else if token_stdin {
+        let mut input = String::new();
+        io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|error| format!("read token from {token_stdin_flag}: {error}"))?;
+        input
+    } else {
+        return Err(format!(
+            "missing token source: pass {token_file_flag} <path>, {token_stdin_flag}, or {token_flag} <token>"
+        ));
+    };
+
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(format!(
+            "empty token from input; pass {token_file_flag} <path>, {token_stdin_flag}, or {token_flag} <token>"
+        ));
+    }
+    Ok(token)
 }
 
 fn login_state_path(override_path: Option<&PathBuf>) -> Result<PathBuf, String> {
@@ -2156,7 +2248,7 @@ fn doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), String> {
             checks.push(Check::fail(
                 "control-plane configured",
                 redact(&error),
-                "run `map login save --map-control-endpoint <url> --access-token <token>`",
+                "run `map login save --map-control-endpoint <url> --access-token-file <path>`",
             ));
             return emit_doctor(cli, &checks);
         }
@@ -2562,6 +2654,8 @@ mod tests {
             login_state: Some(path.clone()),
             endpoint: None,
             token: None,
+            token_file: None,
+            token_stdin: false,
             json: false,
             command: Command::Whoami,
         };
@@ -2569,8 +2663,10 @@ mod tests {
         let err = resolve_state(&cli).unwrap_err();
 
         assert!(err.contains(&format!("read login state {}", path.display())));
-        assert!(err.contains("map login save --map-control-endpoint <url> --access-token <token>"));
-        assert!(err.contains("--endpoint <url> --token <token>"));
+        assert!(
+            err.contains("map login save --map-control-endpoint <url> --access-token-file <path>")
+        );
+        assert!(err.contains("--endpoint <url> --token-file <path>"));
         fs::remove_file(path).ok();
     }
 
@@ -2592,6 +2688,8 @@ mod tests {
             login_state: Some(path.clone()),
             endpoint: None,
             token: None,
+            token_file: None,
+            token_stdin: false,
             json: false,
             command: Command::Login(LoginCommand {
                 command: LoginSubcommand::PrintToken(PrintTokenArgs {
@@ -2602,8 +2700,150 @@ mod tests {
         let err = run(cli).unwrap_err();
 
         assert!(err.contains("login state is not valid for audience `jason-controller`"));
-        assert!(err.contains("map login save --map-control-endpoint <url> --access-token <token>"));
+        assert!(
+            err.contains("map login save --map-control-endpoint <url> --access-token-file <path>")
+        );
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn login_save_reads_access_token_from_file() {
+        let token_path = temp_file_path("login-token");
+        let state_path = temp_file_path("login-token-state");
+        fs::write(&token_path, "secret-from-file\n").unwrap();
+        fs::remove_file(&state_path).ok();
+
+        let cli = Cli::try_parse_from([
+            "map",
+            "--login-state",
+            state_path.to_str().unwrap(),
+            "login",
+            "save",
+            "--map-control-endpoint",
+            "https://map.example",
+            "--access-token-file",
+            token_path.to_str().unwrap(),
+        ])
+        .expect("login save accepts token file");
+        run(cli).expect("login save reads token file");
+
+        let saved: LoginState =
+            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(saved.access_token, "secret-from-file");
+
+        fs::remove_file(token_path).ok();
+        fs::remove_file(state_path).ok();
+    }
+
+    #[test]
+    fn one_command_auth_reads_token_from_file() {
+        let token_path = temp_file_path("one-command-token");
+        fs::write(&token_path, "one-command-secret\n").unwrap();
+        let cli = Cli::try_parse_from([
+            "map",
+            "--endpoint",
+            "https://map.example",
+            "--token-file",
+            token_path.to_str().unwrap(),
+            "whoami",
+        ])
+        .expect("one-command auth accepts token file");
+
+        let state = resolve_state(&cli).expect("token file resolves state");
+        assert_eq!(state.map_control_endpoint, "https://map.example");
+        assert_eq!(state.access_token, "one-command-secret");
+
+        fs::remove_file(token_path).ok();
+    }
+
+    #[test]
+    fn endpoint_flag_overrides_saved_login_endpoint() {
+        let path = temp_file_path("endpoint-override-login");
+        let state = LoginState {
+            map_control_endpoint: "https://saved.example".to_string(),
+            jason_controller_endpoint: None,
+            access_token: "saved-secret".to_string(),
+            expires_at: None,
+            audience: Some("map-control".to_string()),
+            scopes: vec![],
+            principal: None,
+        };
+        write_login_state(&path, &state).expect("login state should write");
+
+        let cli = Cli::try_parse_from([
+            "map",
+            "--login-state",
+            path.to_str().unwrap(),
+            "--endpoint",
+            "https://override.example",
+            "whoami",
+        ])
+        .expect("endpoint override parses");
+
+        let state = resolve_state(&cli).expect("endpoint override resolves saved state");
+        assert_eq!(state.map_control_endpoint, "https://override.example");
+        assert_eq!(state.access_token, "saved-secret");
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn argv_token_flags_remain_compatible() {
+        Cli::try_parse_from([
+            "map",
+            "--endpoint",
+            "https://map.example",
+            "--token",
+            "test-token",
+            "doctor",
+        ])
+        .expect("global compatibility token flag still parses");
+
+        Cli::try_parse_from([
+            "map",
+            "login",
+            "save",
+            "--map-control-endpoint",
+            "https://map.example",
+            "--access-token",
+            "test-token",
+        ])
+        .expect("login compatibility access-token flag still parses");
+    }
+
+    #[test]
+    fn token_source_errors_do_not_print_secret_values() {
+        let err = read_token_input(
+            "--token",
+            Some(&"   ".to_string()),
+            "--token-file",
+            None,
+            false,
+            "--token-stdin",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("empty token"));
+        assert!(!err.contains("test-token"));
+        assert!(!err.contains("secret"));
+    }
+
+    #[test]
+    fn doctor_auth_remediation_uses_token_file_path() {
+        let check = Check::fail(
+            "control-plane configured",
+            "read login state /tmp/missing: not found",
+            "run `map login save --map-control-endpoint <url> --access-token-file <path>`",
+        );
+        let text = format_check(&check);
+        let value = check_value(&check);
+
+        assert!(text.contains("--access-token-file <path>"), "{text}");
+        assert!(!text.contains("--access-token <token>"), "{text}");
+        assert_eq!(
+            value["remediation"].as_str(),
+            Some("run `map login save --map-control-endpoint <url> --access-token-file <path>`")
+        );
     }
 
     #[test]
@@ -2942,9 +3182,11 @@ identity: {project_ref: owner/repo}
         let help = render_help_for_path(&mut command, &["login", "save"]);
 
         assert!(
-            help.contains(LOGIN_STATE_FLAG_HELP),
+            help.contains(LOGIN_SAVE_HELP),
             "login save should document where the state file is written:\n{help}"
         );
+        assert!(help.contains("--access-token-file"), "{help}");
+        assert!(help.contains("--access-token-stdin"), "{help}");
         assert!(
             !help.contains("--endpoint"),
             "login save should not show command auth endpoint override:\n{help}"
@@ -2969,6 +3211,8 @@ identity: {project_ref: owner/repo}
 
         assert_eq!(cli.endpoint.as_deref(), Some("https://map.example"));
         assert_eq!(cli.token.as_deref(), Some("test-token"));
+        assert!(cli.token_file.is_none());
+        assert!(!cli.token_stdin);
         assert!(matches!(cli.command, Command::Doctor(_)));
     }
 
@@ -3310,6 +3554,8 @@ identity: {project_ref: owner/repo}
             login_state: None,
             endpoint: None,
             token: None,
+            token_file: None,
+            token_stdin: false,
             json: false,
             command: Command::Init(InitArgs {
                 manifest: path.clone(),
@@ -3324,6 +3570,8 @@ identity: {project_ref: owner/repo}
             login_state: None,
             endpoint: None,
             token: None,
+            token_file: None,
+            token_stdin: false,
             json: false,
             command: Command::Init(InitArgs {
                 manifest: path.clone(),

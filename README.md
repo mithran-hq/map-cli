@@ -12,7 +12,15 @@ are always based on committed GitHub refs or SHAs.
 ```sh
 map login save \
   --map-control-endpoint https://map.example.com \
-  --access-token "$MITHRAN_TOKEN" \
+  --access-token-file ~/.config/mithran/map-token \
+  --scope map:* \
+  --scope audience:jason-controller
+
+# When the token is only available in the current shell, pipe it instead of
+# placing it in argv.
+printf '%s' "$MITHRAN_TOKEN" | map login save \
+  --map-control-endpoint https://map.example.com \
+  --access-token-stdin \
   --scope map:* \
   --scope audience:jason-controller
 
@@ -51,6 +59,14 @@ Jason can reuse the MAP login by asking for a controller token:
 
 ```sh
 map login print-token --audience jason-controller
+```
+
+For one-command auth without saved login state, pass an explicit endpoint and
+read the token from a file or stdin:
+
+```sh
+map --endpoint https://map.example.com --token-file ~/.config/mithran/map-token doctor
+printf '%s' "$MITHRAN_TOKEN" | map --endpoint https://map.example.com --token-stdin doctor
 ```
 
 ## Deploy Model
