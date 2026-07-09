@@ -627,11 +627,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Versions(args) => map_versions(&cli, args),
         Command::Publish(args) => map_publish(&cli, args),
         Command::Canary(args) => map_canary(&cli, args),
-        Command::Status(args) => get(
-            &cli,
-            "/v1/map-control/deploy/status",
-            &[("deployment_ref", args.id.as_str())],
-        ),
+        Command::Status(args) => map_status(&cli, args),
         Command::Watch(args) => watch(&cli, args),
         Command::Logs(args) => map_logs(&cli, args),
         Command::Evidence(args) => get(
@@ -934,6 +930,26 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
     }
 }
 
+fn map_status(cli: &Cli, args: &IdArgs) -> Result<(), String> {
+    let (client, state) = client(cli)?;
+    let response = client
+        .get(format!(
+            "{}/v1/map-control/deploy/status",
+            state.map_control_endpoint.trim_end_matches('/'),
+        ))
+        .query(&[("deployment_ref", args.id.as_str())])
+        .bearer_auth(&state.access_token)
+        .send()
+        .map_err(|error| format!("MAP request failed: {error}"))?;
+    let value = parse_deploy_status_response(response.status(), response.text())?;
+    if cli.json {
+        println!("{}", serde_json::to_string(&value).unwrap());
+    } else {
+        print!("{}", render_deploy_status_text(&value));
+    }
+    Ok(())
+}
+
 fn map_logs(cli: &Cli, args: &IdArgs) -> Result<(), String> {
     let (client, state) = client(cli)?;
     let response = client
@@ -971,6 +987,52 @@ fn parse_deploy_logs_response(
         return Err(format!("MAP returned {status}: {}", redact(&text)));
     }
     serde_json::from_str(&text).map_err(|error| format!("read MAP logs response: {error}"))
+}
+
+fn parse_deploy_status_response(
+    status: StatusCode,
+    text: Result<String, reqwest::Error>,
+) -> Result<Value, String> {
+    let text = text.map_err(|error| format!("read MAP status response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("MAP returned {status}: {}", redact(&text)));
+    }
+    serde_json::from_str(&text).map_err(|error| format!("read MAP status response: {error}"))
+}
+
+fn render_deploy_status_text(payload: &Value) -> String {
+    let deployment = payload.get("deployment").unwrap_or(payload);
+    let deployment_ref = payload
+        .get("deployment_ref")
+        .and_then(Value::as_str)
+        .or_else(|| deployment.get("deployment_ref").and_then(Value::as_str))
+        .unwrap_or("(not returned)");
+    let deployment_status = deployment
+        .get("status")
+        .and_then(|status| status.get("status"))
+        .and_then(Value::as_str)
+        .or_else(|| deployment.get("deployment_status").and_then(Value::as_str))
+        .or_else(|| payload.get("deployment_status").and_then(Value::as_str))
+        .unwrap_or("(not returned)");
+
+    let mut out =
+        format!("deployment_ref: {deployment_ref}\ndeployment_status: {deployment_status}\n");
+    if let Some(message) = deployment
+        .get("status")
+        .and_then(|status| status.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| deployment.get("message").and_then(Value::as_str))
+    {
+        out.push_str(&format!("message: {message}\n"));
+    }
+    if let Some(evidence_ref) = deployment
+        .get("evidence_ref")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("evidence_ref").and_then(Value::as_str))
+    {
+        out.push_str(&format!("evidence_ref: {evidence_ref}\n"));
+    }
+    out
 }
 
 fn deploy_logs_route_absent(text: &str) -> bool {
@@ -2706,6 +2768,66 @@ mod tests {
         .unwrap();
 
         assert_eq!(value["deployment"]["status"]["status"], "Succeeded");
+    }
+
+    #[test]
+    fn status_response_parses_and_json_mode_preserves_server_shape() {
+        let raw = r#"{
+            "status": "ok",
+            "deployment": {
+                "deployment_ref": "deployment://production/app/demo-1",
+                "status": {
+                    "status": "BuildFailed",
+                    "message": "build failed"
+                },
+                "evidence_ref": "evidence://demo-1"
+            },
+            "server_extra": { "kept": true }
+        }"#;
+
+        let value = parse_deploy_status_response(StatusCode::OK, Ok(raw.to_string()))
+            .expect("valid status");
+        let round_trip: Value =
+            serde_json::from_str(&serde_json::to_string(&value).unwrap()).unwrap();
+
+        assert_eq!(
+            round_trip["deployment"]["deployment_ref"],
+            "deployment://production/app/demo-1"
+        );
+        assert_eq!(round_trip["deployment"]["status"]["status"], "BuildFailed");
+        assert_eq!(round_trip["server_extra"]["kept"], true);
+    }
+
+    #[test]
+    fn status_text_renders_deployment_ref_status_message_and_evidence() {
+        let payload = json!({
+            "status": "ok",
+            "deployment": {
+                "deployment_ref": "deployment://production/app/demo-1",
+                "status": {
+                    "status": "BuildFailed",
+                    "message": "build failed"
+                },
+                "evidence_ref": "evidence://demo-1"
+            }
+        });
+
+        let rendered = render_deploy_status_text(&payload);
+
+        assert!(rendered.contains("deployment_ref: deployment://production/app/demo-1"));
+        assert!(rendered.contains("deployment_status: BuildFailed"));
+        assert!(rendered.contains("message: build failed"));
+        assert!(rendered.contains("evidence_ref: evidence://demo-1"));
+        assert!(!rendered.contains("\nok\n"));
+    }
+
+    #[test]
+    fn status_text_does_not_turn_missing_fields_into_ok() {
+        let rendered = render_deploy_status_text(&json!({ "status": "ok" }));
+
+        assert!(rendered.contains("deployment_ref: (not returned)"));
+        assert!(rendered.contains("deployment_status: (not returned)"));
+        assert!(!rendered.contains("\nok\n"));
     }
 
     #[test]
