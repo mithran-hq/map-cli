@@ -26,7 +26,7 @@ jobs:
     # cross-repo checkout back into mithran-infra cannot be authenticated from
     # an arbitrary caller repo), so whichever SHA this points at IS the exact
     # normalizer version that runs. There is no second ref to keep in sync.
-    uses: mithran-hq/mithran-infra/.github/workflows/issue-naming-reusable.yml@320451c9c7bdfd5996ef4326aa1a5cf653421d4c
+    uses: mithran-hq/mithran-infra/.github/workflows/issue-naming-reusable.yml@5e5302378fecec197301efbed6ec1eaba1b9d90d
     with:
       known_programs: "PILOT,GOVERN"
       mode: advisory
