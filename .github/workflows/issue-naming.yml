@@ -22,11 +22,16 @@ jobs:
     # burn a run on every finding.
     if: ${{ !startsWith(github.event.issue.title, '[security-finding]') }}
     # The ref pinned here is the entire contract: the reusable workflow embeds
-    # the normalizer source directly (mithran-hq/mithran-infra#1835 — a
-    # cross-repo checkout back into mithran-infra cannot be authenticated from
-    # an arbitrary caller repo), so whichever SHA this points at IS the exact
-    # normalizer version that runs. There is no second ref to keep in sync.
-    uses: mithran-hq/mithran-infra/.github/workflows/issue-naming-reusable.yml@0cc9a9b7949493b1d79d56ec914079b604d857d7
+    # the normalizer source AND the allocated PROGRAM allowlist directly
+    # (mithran-hq/mithran-infra#1835 — a cross-repo checkout back into
+    # mithran-infra cannot be authenticated from an arbitrary caller repo), so
+    # whichever SHA this points at IS the exact normalizer version and the exact
+    # allowlist that run. There is no second ref, and no list, to keep in sync.
+    #
+    # This file therefore passes no `known_programs`. It used to, and every
+    # installed copy then froze whatever list was current on install day
+    # (mithran-hq/mithran-infra#2170). Re-running the installer at a newer ref is
+    # now the only thing a registry change needs.
+    uses: mithran-hq/mithran-infra/.github/workflows/issue-naming-reusable.yml@2f0ce79a476ff63be91dd8f68b2a247b55bdc803
     with:
-      known_programs: "PILOT,GOVERN,MEASURE,CLOSURE,CONNECT,ACPARCH,DELIVERY,SSALPHA"
       mode: advisory
