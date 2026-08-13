@@ -32,6 +32,6 @@ jobs:
     # installed copy then froze whatever list was current on install day
     # (mithran-hq/mithran-infra#2170). Re-running the installer at a newer ref is
     # now the only thing a registry change needs.
-    uses: mithran-hq/mithran-infra/.github/workflows/issue-naming-reusable.yml@b9aebb55fb1dab6995c9a1808da1439cb769ce98
+    uses: mithran-hq/mithran-infra/.github/workflows/issue-naming-reusable.yml@89a95531e29a0f915fd14a1d9e31126a9dfc6b05
     with:
       mode: advisory
