@@ -1,0 +1,9 @@
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+
+# aarch64-apple-darwin comes from .github/workflows/component-artifacts.yml.
+# rustup treats stable and 1.97.0 as different toolchains, so targets a workflow
+# installs for stable are absent here. Removing this target strips the macOS
+# arm64 cross-compile job while reading as a pure version change.
+targets = ["aarch64-apple-darwin"]

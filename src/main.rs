@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -1488,8 +1488,8 @@ fn onboard(cli: &Cli, args: &OnboardArgs) -> Result<(), String> {
         &project_ref,
         value,
         args.with_ci_workflow,
-        workflow_path.as_ref(),
-        manifest_path.as_ref(),
+        workflow_path.as_deref(),
+        manifest_path.as_deref(),
         variables_outcome,
         next,
     );
@@ -1514,13 +1514,14 @@ fn onboard_error_body(value: Option<&Value>, text: &str) -> String {
     value.map_or_else(|| text.to_string(), Value::to_string)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn onboard_output(
     repo: &str,
     project_ref: &str,
     onboard: Value,
     ci_workflow: bool,
-    workflow_path: Option<&PathBuf>,
-    manifest_path: Option<&PathBuf>,
+    workflow_path: Option<&Path>,
+    manifest_path: Option<&Path>,
     variables: Value,
     next: &str,
 ) -> (Value, String) {
@@ -2771,10 +2772,10 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    fn access_args_for(file: &PathBuf) -> AccessApplyArgs {
+    fn access_args_for(file: &Path) -> AccessApplyArgs {
         AccessApplyArgs {
             repo_dir: None,
-            file: Some(file.clone()),
+            file: Some(file.to_path_buf()),
             app_ref: None,
             tenant_ref: None,
             account_ref: None,
