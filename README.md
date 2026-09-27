@@ -113,12 +113,15 @@ without changing what end-users see.
   (production/preview/release), and which internal version is currently published (or
   `(not published)`). When the production alias has an active canary split, alias output also
   shows the canary deployment ref and weight. `<app>` is the app name, normalized to `app:<app>`.
-- `map publish <app> [--version <label> | --deployment-ref <ref>] [--expected-sha <sha>]
-  [--actor <ref>]` POSTs `/v1/map-control/deploy/publish` to pin the public URL to a chosen
-  version. `--version` is resolved to a `deployment_ref` via `routes/status`. The
-  control-plane is **review-gated** (rejects unless the version is a reviewed, succeeded
-  deploy) and **stale-safe** (with `--expected-sha`, rejects if the version's recorded source
-  SHA moved). On success it prints the published URL.
+- `map publish <app> [--version <label> | --deployment-ref <ref>]
+  [--expected-sha <sha>] [--actor <ref>] [--intent-id <hex>]
+  [--attempted-state-version <n>]` POSTs `/v1/map-control/deploy/publish`
+  to pin the public URL to a chosen version. `--version` is resolved to a
+  `deployment_ref` via `routes/status`. The control-plane is
+  **review-gated** (rejects unless the version is a reviewed, succeeded
+  deploy) and **stale-safe** (with `--expected-sha`, rejects if the
+  version's recorded source SHA moved). On success it prints the published
+  URL.
 
 ## Canary Model
 
@@ -131,8 +134,33 @@ Canary operations mutate the app's production alias through the control-plane ca
   `promote`, moving the active canary to current at 100% and clearing the split.
 - `map canary rollback <app> --deployment-ref <ref>` POSTs action `rollback`, clearing the split
   and keeping current production at 100%.
-- Text output reports the action, app, canary deployment ref, alias/hostname when returned, and
-  result. `--json` prints the server response unchanged.
+- Text output reports the action, app, canary deployment ref,
+  alias/hostname when returned, and result. On `status: ok`, `--json`
+  prints the server response; on `status: pending` it prints the
+  transformed pending object described below and exits nonzero.
+
+## Manual action results
+
+`map publish`, `map rollback`, and `map canary` require the
+control-plane application `status` to be `ok`. A transport 2xx alone is
+not completion. A `status: pending` reply means the operation is not
+finished:
+
+- Human mode prints the pending coordinates (`action`, `target_id`,
+  `route_pointer_ref`, `intent_id`, `reason`, and
+  `attempted_state_version` when present) and exits nonzero.
+- `--json` prints one transformed object with `ok: false` and the same
+  bounded coordinates, instead of the raw server body, and exits nonzero.
+- Resume the same operation with `--intent-id <returned-intent-id>`. Add
+  `--attempted-state-version <returned-version>` for a `commit_unknown`
+  result that the control-plane proved absent. Both flags are validated as
+  a 32-character lowercase hex intent and a nonnegative decimal version; an
+  invalid value fails before any HTTP call.
+- Retry the same command with the same immutable inputs. Do not start a
+  replacement operation or invent a new intent.
+
+Malformed or unknown application statuses, reasons, and coordinates are
+rejected with a diagnostic that never echoes the rejected value.
 
 `map domain` (custom-domain binding) is a separate capability and is not part of this CLI.
 

@@ -29,6 +29,22 @@ const DEFAULT_STARTER_COMMAND: &str = "npm start";
 const AUTH_FLAGS_HELP: &str = "Authentication flags: --login-state <path>, or --endpoint <url> with --token-file <path>, --token-stdin, or --token <token>";
 const LOGIN_SAVE_HELP: &str = "State path flag: --login-state <path>\nToken input: prefer --access-token-file <path> or --access-token-stdin; --access-token <token> is also accepted.";
 const JSON_OUTPUT_ALREADY_EMITTED_ERROR: &str = "__map_json_output_already_emitted:";
+/// Canonical manual-action application status for a completed operation (CP219).
+const MANUAL_STATUS_OK: &str = "ok";
+/// Canonical manual-action application status for an operation that is not yet complete.
+const MANUAL_STATUS_PENDING: &str = "pending";
+/// Closed reason-code enum carried by a `status: pending` manual-action result.
+const MANUAL_PENDING_REASON_CODES: [&str; 9] = [
+    "configuration",
+    "authority",
+    "intent_conflict",
+    "lease_lost",
+    "commit_unknown",
+    "barrier",
+    "preparation_unknown",
+    "delivery_unknown",
+    "progress_pending",
+];
 
 #[derive(Parser)]
 #[command(
@@ -432,6 +448,16 @@ struct PublishArgs {
     /// Actor ref to attribute the publish to. The control-plane defaults one when omitted.
     #[arg(long)]
     actor: Option<String>,
+
+    /// Explicit durable intent ID to resume (32-character lowercase hex). Retries the same
+    /// operation instead of creating a replacement.
+    #[arg(long = "intent-id")]
+    intent_id: Option<String>,
+
+    /// Attempted canonical state version for a proven-absent commit-unknown resume. Requires
+    /// --intent-id; the control-plane resolves the durable intent rather than minting one.
+    #[arg(long = "attempted-state-version")]
+    attempted_state_version: Option<String>,
 }
 
 /// Operator controls for a weighted app-environment canary.
@@ -466,6 +492,16 @@ struct CanaryStartArgs {
     /// Canary traffic percentage. Must be an integer from 1 through 99.
     #[arg(long)]
     weight: u32,
+
+    /// Explicit durable intent ID to resume (32-character lowercase hex). Retries the same
+    /// operation instead of creating a replacement.
+    #[arg(long = "intent-id")]
+    intent_id: Option<String>,
+
+    /// Attempted canonical state version for a proven-absent commit-unknown resume. Requires
+    /// --intent-id.
+    #[arg(long = "attempted-state-version")]
+    attempted_state_version: Option<String>,
 }
 
 #[derive(Args)]
@@ -476,6 +512,16 @@ struct CanaryEndArgs {
     /// Deployment ref identifying the active canary or its production alias.
     #[arg(long = "deployment-ref")]
     deployment_ref: String,
+
+    /// Explicit durable intent ID to resume (32-character lowercase hex). Retries the same
+    /// operation instead of creating a replacement.
+    #[arg(long = "intent-id")]
+    intent_id: Option<String>,
+
+    /// Attempted canonical state version for a proven-absent commit-unknown resume. Requires
+    /// --intent-id.
+    #[arg(long = "attempted-state-version")]
+    attempted_state_version: Option<String>,
 }
 
 #[derive(Args)]
@@ -506,6 +552,16 @@ struct RollbackArgs {
     /// Evidence ref to attach to the rollback request.
     #[arg(long)]
     evidence_ref: Option<String>,
+
+    /// Explicit durable intent ID to resume (32-character lowercase hex). Retries the same
+    /// operation instead of creating a replacement.
+    #[arg(long = "intent-id")]
+    intent_id: Option<String>,
+
+    /// Attempted canonical state version for a proven-absent commit-unknown resume. Requires
+    /// --intent-id.
+    #[arg(long = "attempted-state-version")]
+    attempted_state_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -670,14 +726,7 @@ fn run(cli: Cli) -> Result<(), String> {
             "/v1/map-control/deploy/evidence",
             &[("deployment_ref", args.id.as_str())],
         ),
-        Command::Rollback(args) => post(
-            &cli,
-            "/v1/map-control/deploy/rollback",
-            json!({
-                "deployment_ref": args.id,
-                "authority_evidence_ref": args.evidence_ref,
-            }),
-        ),
+        Command::Rollback(args) => map_rollback(&cli, args),
         Command::Version => print_json_or_text(
             cli.json,
             json!({ "name": "map-cli", "binary": "map", "version": VERSION }),
@@ -1260,6 +1309,9 @@ fn is_invalid_usage_error(error: &str) -> bool {
         || error.starts_with("exposure must be ")
         || error.starts_with("--weight must be ")
         || error.starts_with("pick a version to publish:")
+        || error.starts_with("--intent-id must be ")
+        || error.starts_with("--attempted-state-version must be ")
+        || error.starts_with("--attempted-state-version requires ")
         || error.starts_with("no GitHub token:")
 }
 
@@ -1285,6 +1337,12 @@ fn error_code(error: &str) -> &'static str {
         "invalid_weight"
     } else if error.starts_with("pick a version to publish:") {
         "missing_publish_target"
+    } else if error.starts_with("--intent-id must be ") {
+        "invalid_intent_id"
+    } else if error.starts_with("--attempted-state-version must be ") {
+        "invalid_attempted_state_version"
+    } else if error.starts_with("--attempted-state-version requires ") {
+        "missing_intent_id"
     } else if error.starts_with("no GitHub token:") {
         "missing_github_token"
     } else if error.starts_with("read login state ") {
@@ -1335,6 +1393,316 @@ fn redact(text: &str) -> String {
         }
     }
     redacted
+}
+
+// ─────────────────── canonical manual action results (CP219) ───────────────────
+
+/// A validated `status: pending` manual-action result. These fields are the
+/// bounded resume coordinates the control-plane promises; unknown reason codes
+/// and missing coordinates refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManualPending {
+    action: String,
+    target_id: String,
+    route_pointer_ref: String,
+    intent_id: String,
+    reason: String,
+    attempted_state_version: Option<String>,
+}
+
+/// The decoded application status of a manual action. Transport success alone
+/// is never completion: only `status: ok` maps to `Completed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManualOutcome {
+    Completed,
+    Pending(ManualPending),
+}
+
+/// Bound on a rendered manual-action coordinate reference.
+const MANUAL_COORDINATE_MAX: usize = 256;
+
+/// True when `text` is exactly `length` lowercase hexadecimal characters,
+/// matching the control-plane `hex_id(_, length)` identity reservation.
+fn is_lowercase_hex_id(text: &str, length: usize) -> bool {
+    text.len() == length
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// True when `text` is a bounded nonnegative decimal state version that fits
+/// the control-plane `i64` comparison.
+fn is_bounded_state_version(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|byte| byte.is_ascii_digit())
+        && text.parse::<i64>().is_ok()
+}
+
+/// True when `text` is a bounded lowercase action code.
+fn is_bounded_action(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 64
+        && text.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        })
+}
+
+/// True when `text` is a bounded `scheme://reference` route pointer. The
+/// bounded character class rejects credential-bearing strings without echoing.
+fn is_bounded_route_pointer(text: &str) -> bool {
+    if text.is_empty() || text.len() > MANUAL_COORDINATE_MAX {
+        return false;
+    }
+    let Some((scheme, remainder)) = text.split_once("://") else {
+        return false;
+    };
+    if scheme.is_empty()
+        || remainder.is_empty()
+        || !scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return false;
+    }
+    text.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b':' | b'/' | b'.' | b'_' | b'-' | b'@' | b'#' | b'~' | b'+'
+            )
+    })
+}
+
+/// True when `value` embeds the caller's known bearer secret. A reflected
+/// credential must never reach output even when its marker is absent.
+fn contains_known_secret(value: &str, known_secret: &str) -> bool {
+    !known_secret.is_empty() && value.contains(known_secret)
+}
+
+/// Validate an explicit `--intent-id`: exactly 32 lowercase hex characters.
+/// The diagnostic is value-free and never echoes the rejected input.
+fn validate_intent_id(intent_id: &str) -> Result<(), String> {
+    if is_lowercase_hex_id(intent_id, 32) {
+        Ok(())
+    } else {
+        Err("--intent-id must be a 32-character lowercase hex ID".to_string())
+    }
+}
+
+/// Validate `--attempted-state-version`: a nonnegative decimal state version
+/// bounded by the control-plane `i64` comparison. The diagnostic is value-free.
+fn validate_attempted_state_version(version: &str) -> Result<(), String> {
+    if is_bounded_state_version(version) {
+        Ok(())
+    } else {
+        Err("--attempted-state-version must be a nonnegative integer".to_string())
+    }
+}
+
+/// Validate the explicit resume flags together: a version requires an intent.
+fn validate_manual_echo(
+    intent_id: Option<&str>,
+    attempted_state_version: Option<&str>,
+) -> Result<(), String> {
+    if let Some(intent_id) = intent_id {
+        validate_intent_id(intent_id)?;
+    }
+    if let Some(version) = attempted_state_version {
+        if intent_id.is_none() {
+            return Err("--attempted-state-version requires --intent-id".to_string());
+        }
+        validate_attempted_state_version(version)?;
+    }
+    Ok(())
+}
+
+/// Echo explicit resume coordinates into an action body without replacing any
+/// immutable action, target, expected-SHA or context field already present.
+fn apply_manual_echo(
+    body: &mut Value,
+    intent_id: Option<&str>,
+    attempted_state_version: Option<&str>,
+) {
+    if let Some(intent_id) = intent_id {
+        body["intent_id"] = json!(intent_id);
+    }
+    if let Some(version) = attempted_state_version {
+        body["attempted_state_version"] = json!(version);
+    }
+}
+
+fn required_manual_string(value: &Value, field: &str) -> Result<String, String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("pending manual action response is missing `{field}`"))
+}
+
+fn decode_manual_pending(value: &Value, known_secret: &str) -> Result<ManualPending, String> {
+    let reason = required_manual_string(value, "reason")?;
+    if !MANUAL_PENDING_REASON_CODES.contains(&reason.as_str()) {
+        return Err("pending manual action response has unknown reason code".to_string());
+    }
+    let action = required_manual_string(value, "action")?;
+    if !is_bounded_action(&action) {
+        return Err("pending manual action response has malformed action".to_string());
+    }
+    let target_id = required_manual_string(value, "target_id")?;
+    if !is_lowercase_hex_id(&target_id, 32) {
+        return Err("pending manual action response has malformed target_id".to_string());
+    }
+    let route_pointer_ref = required_manual_string(value, "route_pointer_ref")?;
+    if !is_bounded_route_pointer(&route_pointer_ref) {
+        return Err("pending manual action response has malformed route_pointer_ref".to_string());
+    }
+    let intent_id = required_manual_string(value, "intent_id")?;
+    if !is_lowercase_hex_id(&intent_id, 32) {
+        return Err("pending manual action response has malformed intent_id".to_string());
+    }
+    let attempted_state_version = match value.get("attempted_state_version") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(version)) if is_bounded_state_version(version) => Some(version.clone()),
+        Some(_) => {
+            return Err(
+                "pending manual action response has malformed attempted_state_version".to_string(),
+            )
+        }
+    };
+    for coordinate in [
+        action.as_str(),
+        target_id.as_str(),
+        route_pointer_ref.as_str(),
+        intent_id.as_str(),
+        reason.as_str(),
+        attempted_state_version.as_deref().unwrap_or_default(),
+    ] {
+        if contains_known_secret(coordinate, known_secret) {
+            return Err("pending manual action response contains credential material".to_string());
+        }
+    }
+    Ok(ManualPending {
+        action,
+        target_id,
+        route_pointer_ref,
+        intent_id,
+        reason,
+        attempted_state_version,
+    })
+}
+
+/// Decode a manual-action response body. Only `status: ok` is completion;
+/// `status: pending` is incomplete. Every missing, unknown or malformed shape
+/// refuses rather than falling back to transport success. Diagnostics are
+/// value-free: a rejected status, reason or coordinate is never echoed.
+fn decode_manual_result(text: &str, known_secret: &str) -> Result<ManualOutcome, String> {
+    let value: Value = serde_json::from_str(text)
+        .map_err(|error| format!("parse manual action response: {error}"))?;
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "manual action response is missing a string status".to_string())?;
+    match status {
+        MANUAL_STATUS_OK => Ok(ManualOutcome::Completed),
+        MANUAL_STATUS_PENDING => Ok(ManualOutcome::Pending(decode_manual_pending(
+            &value,
+            known_secret,
+        )?)),
+        _ => Err(format!(
+            "manual action response has unknown status; expected {} or {}",
+            MANUAL_STATUS_OK, MANUAL_STATUS_PENDING
+        )),
+    }
+}
+
+/// Render a validated pending result. Coordinates are already bounded to the
+/// server contract, so they are echoed verbatim and never passed through a
+/// marker-only redactor.
+fn manual_pending_json(pending: &ManualPending) -> Value {
+    let mut value = json!({
+        "ok": false,
+        "status": MANUAL_STATUS_PENDING,
+        "action": &pending.action,
+        "target_id": &pending.target_id,
+        "route_pointer_ref": &pending.route_pointer_ref,
+        "intent_id": &pending.intent_id,
+        "reason": &pending.reason,
+    });
+    if let Some(version) = &pending.attempted_state_version {
+        value["attempted_state_version"] = json!(version);
+    }
+    value
+}
+
+fn render_manual_pending_text(pending: &ManualPending) -> String {
+    let mut out = format!(
+        "manual action pending\naction: {}\nstatus: pending\ntarget_id: {}\nroute_pointer_ref: {}\nintent_id: {}\nreason: {}\n",
+        pending.action,
+        pending.target_id,
+        pending.route_pointer_ref,
+        pending.intent_id,
+        pending.reason,
+    );
+    if let Some(version) = &pending.attempted_state_version {
+        out.push_str(&format!("attempted_state_version: {}\n", version));
+    }
+    out
+}
+
+/// Report an incomplete manual action as a nonzero failure. JSON mode emits a
+/// single parseable object and suppresses a second payload; human mode prints
+/// the pending coordinates and a stderr diagnostic through the error path.
+/// The diagnostic repeats only validated coordinates, never raw server bytes.
+fn manual_pending_error(json_output: bool, pending: &ManualPending) -> String {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&manual_pending_json(pending)).unwrap()
+        );
+        json_output_already_emitted_error("manual_action_pending")
+    } else {
+        print!("{}", render_manual_pending_text(pending));
+        format!(
+            "manual action pending: reason={} intent_id={}; resolve the same intent before retrying",
+            pending.reason, pending.intent_id
+        )
+    }
+}
+
+/// Scrub the caller's known bearer secret from a raw manual-action response
+/// body before it can reach an error diagnostic. This is a typed manual-path
+/// guard; unrelated API redaction is unchanged.
+fn redact_manual_body(text: &str, known_secret: &str) -> String {
+    let redacted = redact(text);
+    if known_secret.is_empty() {
+        redacted
+    } else {
+        redacted.replace(known_secret, "[REDACTED]")
+    }
+}
+
+/// POST a manual action and return its status, body and the bearer secret used
+/// so downstream diagnostics can scrub a reflected credential.
+fn post_manual(cli: &Cli, path: &str, body: Value) -> Result<(StatusCode, String, String), String> {
+    let (http, state) = client(cli)?;
+    let access_token = state.access_token.clone();
+    let response = http
+        .post(format!(
+            "{}{}",
+            state.map_control_endpoint.trim_end_matches('/'),
+            path
+        ))
+        .bearer_auth(&state.access_token)
+        .json(&body)
+        .send()
+        .map_err(|error| format!("MAP request failed: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|error| format!("read MAP response: {error}"))?;
+    Ok((status, text, access_token))
 }
 
 // ─────────────────────── map deploy (direct brokered control-plane call) ───────────────────────
@@ -2123,6 +2491,10 @@ fn render_versions_text(payload: &Value) -> String {
 /// review-gated (400 unless the version is a reviewed, succeeded deploy) and stale-safe (409 when
 /// `--expected-sha` no longer matches the version's recorded source SHA).
 fn map_publish(cli: &Cli, args: &PublishArgs) -> Result<(), String> {
+    validate_manual_echo(
+        args.intent_id.as_deref(),
+        args.attempted_state_version.as_deref(),
+    )?;
     let app_ref = normalize_app_ref(&args.app);
     let deployment_ref = match &args.deployment_ref {
         Some(deployment_ref) => deployment_ref.clone(),
@@ -2138,43 +2510,44 @@ fn map_publish(cli: &Cli, args: &PublishArgs) -> Result<(), String> {
         }
     };
 
-    let body = build_publish_body(
+    let mut body = build_publish_body(
         &app_ref,
         &deployment_ref,
         args.actor.as_deref(),
         args.expected_sha.as_deref(),
     );
+    apply_manual_echo(
+        &mut body,
+        args.intent_id.as_deref(),
+        args.attempted_state_version.as_deref(),
+    );
 
-    let (http, state) = client(cli)?;
-    let response = http
-        .post(format!(
-            "{}/v1/map-control/deploy/publish",
-            state.map_control_endpoint.trim_end_matches('/'),
-        ))
-        .bearer_auth(&state.access_token)
-        .json(&body)
-        .send()
-        .map_err(|error| format!("MAP request failed: {error}"))?;
-
-    let status = response.status();
-    let text = response
-        .text()
-        .map_err(|error| format!("read MAP response: {error}"))?;
+    let (status, text, access_token) = post_manual(cli, "/v1/map-control/deploy/publish", body)?;
     match status {
         StatusCode::OK | StatusCode::CREATED | StatusCode::ACCEPTED => {}
         StatusCode::BAD_REQUEST => {
             return Err(format!(
                 "version not publishable: must be a reviewed, succeeded deploy ({})",
-                redact(&text)
+                redact_manual_body(&text, &access_token)
             ));
         }
         StatusCode::CONFLICT => {
             return Err(format!(
                 "stale: the reviewed source moved; re-check `map versions` ({})",
-                redact(&text)
+                redact_manual_body(&text, &access_token)
             ));
         }
-        _ => return Err(format!("MAP returned {status}: {}", redact(&text))),
+        _ => {
+            return Err(format!(
+                "MAP returned {status}: {}",
+                redact_manual_body(&text, &access_token)
+            ))
+        }
+    }
+
+    match decode_manual_result(&text, &access_token)? {
+        ManualOutcome::Completed => {}
+        ManualOutcome::Pending(pending) => return Err(manual_pending_error(cli.json, &pending)),
     }
 
     if cli.json {
@@ -2249,28 +2622,67 @@ fn build_publish_body(
     body
 }
 
+/// `map rollback <id>`: POST the rollback action and require an application
+/// `status: ok` result. A `status: pending` reply stays incomplete and exits
+/// nonzero; transport 2xx alone is never reported as success.
+fn map_rollback(cli: &Cli, args: &RollbackArgs) -> Result<(), String> {
+    validate_manual_echo(
+        args.intent_id.as_deref(),
+        args.attempted_state_version.as_deref(),
+    )?;
+    let mut body = json!({
+        "deployment_ref": args.id,
+        "authority_evidence_ref": args.evidence_ref,
+    });
+    apply_manual_echo(
+        &mut body,
+        args.intent_id.as_deref(),
+        args.attempted_state_version.as_deref(),
+    );
+    let (status, text, access_token) = post_manual(cli, "/v1/map-control/deploy/rollback", body)?;
+    if status != StatusCode::OK && status != StatusCode::CREATED && status != StatusCode::ACCEPTED {
+        return Err(format!(
+            "MAP returned {status}: {}",
+            redact_manual_body(&text, &access_token)
+        ));
+    }
+    match decode_manual_result(&text, &access_token)? {
+        ManualOutcome::Completed => {}
+        ManualOutcome::Pending(pending) => return Err(manual_pending_error(cli.json, &pending)),
+    }
+    print_manual_completed(cli.json, &text)
+}
+
+fn print_manual_completed(json_output: bool, text: &str) -> Result<(), String> {
+    if json_output {
+        println!("{text}");
+    } else if let Some(deployment_ref) = serde_json::from_str::<Value>(text)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.get("deployment_ref"))
+        .and_then(|value| value.as_str())
+    {
+        println!("{deployment_ref}");
+    } else {
+        println!("ok");
+    }
+    Ok(())
+}
+
 // ───────────────────────────── map canary (ADR-0017) ─────────────────────────────
 
 fn map_canary(cli: &Cli, args: &CanaryArgs) -> Result<(), String> {
     let request = canary_request(args)?;
-    let (http, state) = client(cli)?;
-    let response = http
-        .post(format!(
-            "{}{}",
-            state.map_control_endpoint.trim_end_matches('/'),
-            CANARY_DEPLOY_PATH,
-        ))
-        .bearer_auth(&state.access_token)
-        .json(&request.body)
-        .send()
-        .map_err(|error| format!("MAP request failed: {error}"))?;
-
-    let status = response.status();
-    let text = response
-        .text()
-        .map_err(|error| format!("read MAP response: {error}"))?;
+    let (status, text, access_token) = post_manual(cli, CANARY_DEPLOY_PATH, request.body.clone())?;
     if status != StatusCode::OK && status != StatusCode::CREATED && status != StatusCode::ACCEPTED {
-        return Err(format!("MAP returned {status}: {}", redact(&text)));
+        return Err(format!(
+            "MAP returned {status}: {}",
+            redact_manual_body(&text, &access_token)
+        ));
+    }
+    match decode_manual_result(&text, &access_token)? {
+        ManualOutcome::Completed => {}
+        ManualOutcome::Pending(pending) => return Err(manual_pending_error(cli.json, &pending)),
     }
     if cli.json {
         println!("{text}");
@@ -2293,39 +2705,63 @@ struct CanaryRequest {
     body: Value,
 }
 
+fn canary_echo_inputs(args: &CanaryArgs) -> (Option<&str>, Option<&str>) {
+    match &args.command {
+        CanarySubcommand::Start(start) => (
+            start.intent_id.as_deref(),
+            start.attempted_state_version.as_deref(),
+        ),
+        CanarySubcommand::Promote(end) | CanarySubcommand::Rollback(end) => (
+            end.intent_id.as_deref(),
+            end.attempted_state_version.as_deref(),
+        ),
+    }
+}
+
 fn canary_request(args: &CanaryArgs) -> Result<CanaryRequest, String> {
+    let (intent_id, attempted_state_version) = canary_echo_inputs(args);
+    validate_manual_echo(intent_id, attempted_state_version)?;
     match &args.command {
         CanarySubcommand::Start(start) => {
             validate_canary_weight(start.weight)?;
             let app_ref = normalize_app_ref(&start.app);
+            let mut body =
+                build_canary_body("start", &app_ref, &start.deployment_ref, Some(start.weight));
+            apply_manual_echo(&mut body, intent_id, attempted_state_version);
             Ok(CanaryRequest {
                 action: "start",
                 app: app_ref.trim_start_matches("app:").to_string(),
                 app_ref: app_ref.clone(),
                 deployment_ref: start.deployment_ref.clone(),
                 weight_pct: Some(start.weight),
-                body: build_canary_body(
-                    "start",
-                    &app_ref,
-                    &start.deployment_ref,
-                    Some(start.weight),
-                ),
+                body,
             })
         }
-        CanarySubcommand::Promote(promote) => canary_end_request("promote", promote),
-        CanarySubcommand::Rollback(rollback) => canary_end_request("rollback", rollback),
+        CanarySubcommand::Promote(promote) => {
+            canary_end_request("promote", promote, intent_id, attempted_state_version)
+        }
+        CanarySubcommand::Rollback(rollback) => {
+            canary_end_request("rollback", rollback, intent_id, attempted_state_version)
+        }
     }
 }
 
-fn canary_end_request(action: &'static str, args: &CanaryEndArgs) -> Result<CanaryRequest, String> {
+fn canary_end_request(
+    action: &'static str,
+    args: &CanaryEndArgs,
+    intent_id: Option<&str>,
+    attempted_state_version: Option<&str>,
+) -> Result<CanaryRequest, String> {
     let app_ref = normalize_app_ref(&args.app);
+    let mut body = build_canary_body(action, &app_ref, &args.deployment_ref, None);
+    apply_manual_echo(&mut body, intent_id, attempted_state_version);
     Ok(CanaryRequest {
         action,
         app: app_ref.trim_start_matches("app:").to_string(),
         app_ref: app_ref.clone(),
         deployment_ref: args.deployment_ref.clone(),
         weight_pct: None,
-        body: build_canary_body(action, &app_ref, &args.deployment_ref, None),
+        body,
     })
 }
 
@@ -4962,6 +5398,8 @@ identity: {project_ref: owner/repo}
                 app: "gtd-tracker".to_string(),
                 deployment_ref: "deployment://sandbox/production/gtd-2".to_string(),
                 weight: 20,
+                intent_id: None,
+                attempted_state_version: None,
             }),
         };
         let request = canary_request(&args).expect("valid request");
@@ -5119,5 +5557,340 @@ identity: {project_ref: owner/repo}
             "decision://canary"
         );
         assert_eq!(round_trip["server_extra"]["kept"], true);
+    }
+
+    // ── canonical manual action results (CP219) ──
+
+    /// A 32-lowercase-hex target identity, matching the control-plane
+    /// `OwnerAdmission` contract (`hex_id(target_id, 32)`).
+    const TEST_TARGET_ID: &str = "fedcba9876543210fedcba9876543210";
+    const TEST_ROUTE_POINTER: &str = "route-pointer://sandbox/production/app:gtd-tracker";
+    const TEST_KNOWN_SECRET: &str = "synthetic-bearer-token";
+
+    fn sample_manual_pending() -> ManualPending {
+        ManualPending {
+            action: "pin".to_string(),
+            target_id: TEST_TARGET_ID.to_string(),
+            route_pointer_ref: TEST_ROUTE_POINTER.to_string(),
+            intent_id: "a".repeat(32),
+            reason: "commit_unknown".to_string(),
+            attempted_state_version: None,
+        }
+    }
+
+    fn pending_body() -> Value {
+        json!({
+            "status": "pending",
+            "action": "pin",
+            "target_id": TEST_TARGET_ID,
+            "route_pointer_ref": TEST_ROUTE_POINTER,
+            "intent_id": "0123456789abcdef0123456789abcdef",
+            "reason": "commit_unknown",
+        })
+    }
+
+    #[test]
+    fn decode_manual_result_ok_is_completed() {
+        let outcome = decode_manual_result(r#"{"status":"ok","action":"publish"}"#, "").unwrap();
+        assert_eq!(outcome, ManualOutcome::Completed);
+    }
+
+    #[test]
+    fn decode_manual_result_pending_preserves_coordinates() {
+        let text = serde_json::to_string(&pending_body()).unwrap();
+        match decode_manual_result(&text, "").unwrap() {
+            ManualOutcome::Pending(pending) => {
+                assert_eq!(pending.action, "pin");
+                assert_eq!(pending.target_id, TEST_TARGET_ID);
+                assert_eq!(pending.route_pointer_ref, TEST_ROUTE_POINTER);
+                assert_eq!(pending.intent_id, "0123456789abcdef0123456789abcdef");
+                assert_eq!(pending.reason, "commit_unknown");
+                assert!(pending.attempted_state_version.is_none());
+            }
+            other => panic!("expected pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_manual_result_pending_commit_unknown_preserves_attempted_version() {
+        let mut body = pending_body();
+        body["attempted_state_version"] = json!("7");
+        let text = serde_json::to_string(&body).unwrap();
+        match decode_manual_result(&text, "").unwrap() {
+            ManualOutcome::Pending(pending) => {
+                assert_eq!(pending.reason, "commit_unknown");
+                assert_eq!(pending.attempted_state_version.as_deref(), Some("7"));
+            }
+            other => panic!("expected pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_manual_result_rejects_missing_status() {
+        assert!(decode_manual_result(r#"{"action":"publish"}"#, "").is_err());
+    }
+
+    #[test]
+    fn decode_manual_result_rejects_unknown_status_value_free() {
+        let error = decode_manual_result(r#"{"status":"accepted"}"#, "").unwrap_err();
+        assert!(error.contains("unknown status"), "{error}");
+        assert!(!error.contains("accepted"), "{error}");
+    }
+
+    #[test]
+    fn decode_manual_result_rejects_non_json() {
+        assert!(decode_manual_result("ok", "").is_err());
+    }
+
+    #[test]
+    fn decode_manual_result_rejects_pending_missing_coordinates() {
+        // Every resumable coordinate is required; a partial pending body refuses.
+        for field in [
+            "action",
+            "target_id",
+            "route_pointer_ref",
+            "intent_id",
+            "reason",
+        ] {
+            let mut value = pending_body();
+            value.as_object_mut().unwrap().remove(field);
+            let text = serde_json::to_string(&value).unwrap();
+            let error = decode_manual_result(&text, "").unwrap_err();
+            assert!(error.contains(field), "field {field}: {error}");
+        }
+    }
+
+    #[test]
+    fn decode_manual_result_rejects_unknown_reason_value_free() {
+        let mut body = pending_body();
+        body["reason"] = json!("made_up");
+        let text = serde_json::to_string(&body).unwrap();
+        let error = decode_manual_result(&text, "").unwrap_err();
+        assert!(error.contains("unknown reason"), "{error}");
+        assert!(!error.contains("made_up"), "{error}");
+    }
+
+    #[test]
+    fn decode_manual_result_rejects_every_credential_bearing_coordinate() {
+        // A marker-only redactor leaves the value printable; the decoder must
+        // reject it with a diagnostic that does not include the value.
+        let credential = format!("Bearer {TEST_KNOWN_SECRET}");
+        for field in [
+            "action",
+            "target_id",
+            "route_pointer_ref",
+            "intent_id",
+            "attempted_state_version",
+            "reason",
+            "status",
+        ] {
+            let mut body = pending_body();
+            body[field] = json!(credential);
+            let text = serde_json::to_string(&body).unwrap();
+            let error = decode_manual_result(&text, "").unwrap_err();
+            assert!(
+                !error.contains(TEST_KNOWN_SECRET) && !error.contains("Bearer"),
+                "field {field} leaked: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_manual_result_rejects_reflected_request_bearer() {
+        // Even without a marker, a well-formed-shaped coordinate must not let
+        // the caller's known access token survive decoding.
+        let mut action_body = pending_body();
+        action_body["action"] = json!(TEST_KNOWN_SECRET);
+        let action_error = decode_manual_result(
+            &serde_json::to_string(&action_body).unwrap(),
+            TEST_KNOWN_SECRET,
+        )
+        .unwrap_err();
+        assert!(
+            action_error.contains("credential material"),
+            "{action_error}"
+        );
+        assert!(!action_error.contains(TEST_KNOWN_SECRET), "{action_error}");
+
+        let mut pointer_body = pending_body();
+        pointer_body["route_pointer_ref"] = json!(format!("route-pointer://{TEST_KNOWN_SECRET}"));
+        let pointer_error = decode_manual_result(
+            &serde_json::to_string(&pointer_body).unwrap(),
+            TEST_KNOWN_SECRET,
+        )
+        .unwrap_err();
+        assert!(
+            pointer_error.contains("credential material"),
+            "{pointer_error}"
+        );
+        assert!(
+            !pointer_error.contains(TEST_KNOWN_SECRET),
+            "{pointer_error}"
+        );
+    }
+
+    #[test]
+    fn validate_intent_id_accepts_exactly_32_lowercase_hex() {
+        assert!(validate_intent_id(&"a".repeat(32)).is_ok());
+        assert!(validate_intent_id("0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_intent_id("").is_err());
+        assert!(validate_intent_id(&"a".repeat(31)).is_err());
+        assert!(validate_intent_id(&"a".repeat(33)).is_err());
+        assert!(validate_intent_id(&"A".repeat(32)).is_err());
+        assert!(validate_intent_id(&"g".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn validate_attempted_state_version_is_bounded_nonnegative() {
+        assert!(validate_attempted_state_version("0").is_ok());
+        assert!(validate_attempted_state_version("7").is_ok());
+        assert!(validate_attempted_state_version("9223372036854775807").is_ok());
+        assert!(validate_attempted_state_version("").is_err());
+        assert!(validate_attempted_state_version("-1").is_err());
+        assert!(validate_attempted_state_version("1.5").is_err());
+        assert!(validate_attempted_state_version("9223372036854775808").is_err());
+    }
+
+    #[test]
+    fn validate_manual_echo_requires_intent_for_version() {
+        let version = Some("7");
+        let error = validate_manual_echo(None, version).unwrap_err();
+        assert!(error.contains("requires --intent-id"), "{error}");
+        assert!(validate_manual_echo(Some(&"a".repeat(32)), version).is_ok());
+        assert!(validate_manual_echo(Some(&"a".repeat(32)), None).is_ok());
+    }
+
+    #[test]
+    fn apply_manual_echo_preserves_immutable_action_inputs() {
+        let mut body = json!({
+            "app_ref": "app:gtd-tracker",
+            "deployment_ref": "deployment://sandbox/production/gtd-1",
+            "expected_source_sha": "0123456789abcdef0123456789abcdef01234567",
+        });
+        apply_manual_echo(&mut body, Some(&"b".repeat(32)), Some("9"));
+        assert_eq!(
+            body["deployment_ref"],
+            "deployment://sandbox/production/gtd-1"
+        );
+        assert_eq!(
+            body["expected_source_sha"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(body["intent_id"], "b".repeat(32));
+        assert_eq!(body["attempted_state_version"], "9");
+        let mut bare = json!({ "deployment_ref": "deployment://x" });
+        apply_manual_echo(&mut bare, None, None);
+        assert!(bare.get("intent_id").is_none());
+        assert!(bare.get("attempted_state_version").is_none());
+    }
+
+    #[test]
+    fn manual_pending_json_reports_incomplete_and_preserves_valid_coordinates() {
+        let value = manual_pending_json(&sample_manual_pending());
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["status"], "pending");
+        assert_eq!(value["reason"], "commit_unknown");
+        assert_eq!(value["action"], "pin");
+        assert_eq!(value["target_id"], TEST_TARGET_ID);
+        assert_eq!(value["route_pointer_ref"], TEST_ROUTE_POINTER);
+        assert_eq!(value["intent_id"], "a".repeat(32));
+    }
+
+    #[test]
+    fn manual_pending_text_is_explicit_and_never_ok() {
+        let text = render_manual_pending_text(&sample_manual_pending());
+        assert!(text.contains("status: pending"), "{text}");
+        assert!(text.contains("reason: commit_unknown"), "{text}");
+        assert!(
+            text.contains(&format!("intent_id: {}", "a".repeat(32))),
+            "{text}"
+        );
+        assert!(!text.lines().any(|line| line == "ok"), "{text}");
+        assert!(!text.contains("published"), "{text}");
+    }
+
+    #[test]
+    fn coordinate_bounds_accept_server_contract_and_reject_credentials() {
+        assert!(is_bounded_action("pin"));
+        assert!(is_bounded_action("canary-start"));
+        assert!(!is_bounded_action(&"a".repeat(65)));
+        assert!(!is_bounded_action("Bearer synthetic"));
+        assert!(is_bounded_route_pointer(
+            "route-pointer://sandbox/production/app:gtd-tracker"
+        ));
+        assert!(is_bounded_route_pointer("release-alias://sandbox/app:x"));
+        assert!(!is_bounded_route_pointer("synthetic-bearer-token"));
+        assert!(!is_bounded_route_pointer(
+            "route-pointer://Bearer synthetic"
+        ));
+        assert!(!is_bounded_route_pointer(&"a".repeat(257)));
+    }
+
+    #[test]
+    fn publish_parses_intent_and_attempted_state_version_flags() {
+        let cli = Cli::try_parse_from([
+            "map",
+            "publish",
+            "gtd-tracker",
+            "--deployment-ref",
+            "deployment://sandbox/production/gtd-1",
+            "--intent-id",
+            "0123456789abcdef0123456789abcdef",
+            "--attempted-state-version",
+            "3",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Publish(args) => {
+                assert_eq!(
+                    args.intent_id.as_deref(),
+                    Some("0123456789abcdef0123456789abcdef")
+                );
+                assert_eq!(args.attempted_state_version.as_deref(), Some("3"));
+            }
+            _ => panic!("expected publish"),
+        }
+    }
+
+    #[test]
+    fn rollback_and_canary_parse_intent_flags() {
+        let rollback = Cli::try_parse_from([
+            "map",
+            "rollback",
+            "deployment://sandbox/production/gtd-1",
+            "--intent-id",
+            "0123456789abcdef0123456789abcdef",
+        ])
+        .expect("parses");
+        match rollback.command {
+            Command::Rollback(args) => {
+                assert_eq!(
+                    args.intent_id.as_deref(),
+                    Some("0123456789abcdef0123456789abcdef")
+                );
+                assert!(args.attempted_state_version.is_none());
+            }
+            _ => panic!("expected rollback"),
+        }
+        let canary = Cli::try_parse_from([
+            "map",
+            "canary",
+            "promote",
+            "gtd-tracker",
+            "--deployment-ref",
+            "deployment://sandbox/production/gtd-2",
+            "--attempted-state-version",
+            "3",
+        ])
+        .expect("parses");
+        match canary.command {
+            Command::Canary(args) => match args.command {
+                CanarySubcommand::Promote(end) => {
+                    assert_eq!(end.attempted_state_version.as_deref(), Some("3"));
+                }
+                _ => panic!("expected canary promote"),
+            },
+            _ => panic!("expected canary"),
+        }
     }
 }

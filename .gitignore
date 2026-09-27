@@ -1,4 +1,5 @@
 /target/
 /dist
+/.worktrees/
+/.tmp/
 __pycache__/
-.worktrees/

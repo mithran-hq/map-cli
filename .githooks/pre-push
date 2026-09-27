@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Runs the local landing gate before any push reaches the remote.
+# Activate once per clone with: git config core.hooksPath .githooks
+set -euo pipefail
+
+"$(git rev-parse --show-toplevel)/scripts/ci_local.sh"
